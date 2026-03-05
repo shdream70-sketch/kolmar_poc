@@ -85,17 +85,24 @@ jobs:
         with:
           azcliversion: latest
           inlineScript: |
-            EXPIRY=$(date -u -d "2 hours" '+%Y-%m-%dT%H:%MZ')
+            ACCOUNT_KEY=$(az storage account keys list \
+              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --resource-group KOLMAR-BI \
+              --query "[0].value" \
+              --output tsv)
+            
+            EXPIRY=$(date -u -d "8760 hours" '+%Y-%m-%dT%H:%MZ')
+            
             SAS_URL=$(az storage blob generate-sas \
               --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --account-key "$ACCOUNT_KEY" \
               --container-name ${{ env.BLOB_CONTAINER_NAME }} \
               --name ${{ env.PACKAGE_NAME }} \
               --permissions r \
               --expiry $EXPIRY \
-              --auth-mode login \
-              --as-user \
               --full-uri \
               --output tsv)
+            
             echo "sas_url=$SAS_URL" >> $GITHUB_OUTPUT
 
       - name: Set WEBSITE_RUN_FROM_PACKAGE
