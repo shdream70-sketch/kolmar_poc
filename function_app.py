@@ -1,0 +1,643 @@
+"""
+Azure Functions v2 - KGR Keywords & Papers API
+인터페이스 설계서 v1.2 (20260219) 기반 구현
+
+API 목록:
+  1. GET  /api/v1/keywords/search       키워드 Like 검색
+  2. POST /api/v1/keywords/mainkeywords main_keyword 목록 조회
+  3. POST /api/v1/keywords/count        논문 키워드 집계 수 조회
+  4. POST /api/v1/keywords/list         논문 키워드 집계 목록 조회
+  5. POST /api/v1/papers/search         논문 목록 조회
+  6. POST /api/v1/papers/detail         논문 상세 조회
+
+Gold Layer 테이블:
+  gold.keyword_dim          : keyword_id, keyword_text, normalized_text, created_at
+  gold.keyword_type_map     : keyword_id, keyword_type, source, is_active, ...
+  gold.paper_fact           : paper_id, doi, title, abstract, published_year,
+                              journal_name, paper_url, open_access_pdf_url,
+                              main_keyword, publication_type, main_material, ...
+  gold.paper_keyword_bridge : paper_id, keyword_id, keyword_type, role,
+                              weight, extracted_by, confidence, created_at
+  gold.paper_author_dim     : author_key, author_name, created_at
+  gold.paper_author_bridge  : paper_id, author_key, author_seq
+"""
+
+import json
+import logging
+import azure.functions as func
+from db_helper import execute_query, execute_scalar
+
+app = func.FunctionApp()
+logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────
+# 공통 유틸
+# ──────────────────────────────────────────────────────
+
+def _json_response(data, status_code: int = 200) -> func.HttpResponse:
+    return func.HttpResponse(
+        body=json.dumps(data, ensure_ascii=False, default=str),
+        status_code=status_code,
+        mimetype="application/json"
+    )
+
+def _error_response(message: str, status_code: int = 400) -> func.HttpResponse:
+    return _json_response({"error": message}, status_code)
+
+def _safe_int(value, default: int, min_val: int = 1, max_val: int = None) -> int:
+    try:
+        v = int(value)
+        v = max(min_val, v)
+        if max_val:
+            v = min(max_val, v)
+        return v
+    except (TypeError, ValueError):
+        return default
+
+def _get_json_body(req: func.HttpRequest) -> dict:
+    try:
+        return req.get_json() if req.get_body() else {}
+    except ValueError:
+        return None
+
+
+# ──────────────────────────────────────────────────────
+# 공통 SQL 빌더: 조건 만족 paper_id 서브쿼리
+# ──────────────────────────────────────────────────────
+
+def _build_paper_filter(
+    mainkeyword: str = "",
+    keywords: list = None,
+    year_start=None,
+    year_end=None,
+    journal: str = None,
+    publication_type: str = None
+) -> tuple:
+    """
+    조건을 만족하는 paper_id 서브쿼리 + params 반환
+
+    keywords[] AND 조건:
+      각 키워드별 paper_id를 INTERSECT로 교집합 처리
+
+    Returns: (subquery_sql, params_list)
+    """
+    conditions = []
+    params = []
+
+    if mainkeyword:
+        conditions.append("pf.main_keyword = ?")
+        params.append(mainkeyword)
+    if year_start:
+        conditions.append("pf.published_year >= ?")
+        params.append(int(year_start))
+    if year_end:
+        conditions.append("pf.published_year <= ?")
+        params.append(int(year_end))
+    if journal:
+        conditions.append("pf.journal_name = ?")
+        params.append(journal)
+    if publication_type:
+        conditions.append("pf.publication_type = ?")
+        params.append(publication_type)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    base_sql = f"SELECT pf.paper_id FROM gold.paper_fact pf {where_clause}"
+
+    if not keywords:
+        return base_sql, params
+
+    # keywords[] AND: INTERSECT
+    parts = [base_sql]
+    for kw in keywords:
+        parts.append("""
+            SELECT pkb.paper_id
+            FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+            WHERE kd.keyword_text = ?
+        """)
+        params.append(kw)
+
+    return " INTERSECT ".join(parts), params
+
+
+# ──────────────────────────────────────────────────────
+# 1. GET /api/v1/keywords/search
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/keywords/search", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def keywords_search(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    키워드 Like 검색
+
+    Query Params:
+      text     (string, 필수): 검색 문자열 → like '%text%'
+      pageno   (int,    선택): 기본 1
+      pagesize (int,    선택): 기본 20
+
+    Response:
+      {
+        "pageno": 1, "pagesize": 3, "totalcount": 5, "totalpages": 2,
+        "items": [
+          { "keyword": "haas extract", "categories": ["active_ingredient"] },
+          ...
+        ]
+      }
+    """
+    text     = req.params.get("text", "").strip()
+    pageno   = _safe_int(req.params.get("pageno"),   1,  min_val=1)
+    pagesize = _safe_int(req.params.get("pagesize"), 20, min_val=1, max_val=100)
+    offset   = (pageno - 1) * pagesize
+
+    if not text:
+        return _error_response("text 파라미터는 필수입니다.", 400)
+
+    pattern = f"%{text}%"
+
+    try:
+        totalcount = execute_scalar("""
+            SELECT COUNT(DISTINCT kd.keyword_text)
+            FROM gold.keyword_dim kd
+            WHERE kd.keyword_text LIKE ? OR kd.normalized_text LIKE ?
+        """, [pattern, pattern])
+
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
+
+        kw_rows = execute_query("""
+            SELECT DISTINCT kd.keyword_text
+            FROM gold.keyword_dim kd
+            WHERE kd.keyword_text LIKE ? OR kd.normalized_text LIKE ?
+            ORDER BY kd.keyword_text
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, [pattern, pattern, offset, pagesize])
+
+        items = []
+        for row in kw_rows:
+            kw_text = row["keyword_text"]
+            cat_rows = execute_query("""
+                SELECT DISTINCT pkb.keyword_type
+                FROM gold.paper_keyword_bridge pkb
+                INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+                WHERE kd.keyword_text = ?
+                ORDER BY pkb.keyword_type
+            """, [kw_text])
+            items.append({
+                "keyword": kw_text,
+                "categories": [r["keyword_type"] for r in cat_rows]
+            })
+
+        return _json_response({
+            "pageno": pageno, "pagesize": pagesize,
+            "totalcount": totalcount, "totalpages": totalpages,
+            "items": items
+        })
+
+    except Exception as e:
+        logger.exception("keywords_search error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 2. POST /api/v1/keywords/mainkeywords
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/keywords/mainkeywords", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def keywords_mainkeywords(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    main_keyword 목록 조회
+
+    Request Body:
+      {
+        "keywords": ["nanoparticle", "antioxidant"],  // 필수, AND 조건
+        "pageno": 1,
+        "pagesize": 5
+      }
+
+    Response:
+      {
+        "pageno": 1, "pagesize": 5, "totalcount": 18, "totalpages": 4,
+        "mainkeywords": ["zein", "chitosan", "silk fibroin", ...]
+      }
+      totalcount: 조건 만족 논문 수
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    keywords = body.get("keywords", [])
+    pageno   = _safe_int(body.get("pageno"),   1,  min_val=1)
+    pagesize = _safe_int(body.get("pagesize"), 20, min_val=1, max_val=100)
+    offset   = (pageno - 1) * pagesize
+
+    if not keywords or not isinstance(keywords, list):
+        return _error_response("keywords 배열은 필수이며 1개 이상이어야 합니다.", 400)
+
+    try:
+        subquery, params = _build_paper_filter(keywords=keywords)
+
+        # totalcount: 조건 만족 논문 수
+        totalcount = execute_scalar(
+            f"SELECT COUNT(*) FROM ({subquery}) AS t", params
+        )
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
+
+        # 해당 논문들의 main_keyword DISTINCT 목록
+        mk_rows = execute_query(f"""
+            SELECT DISTINCT pf.main_keyword
+            FROM gold.paper_fact pf
+            WHERE pf.paper_id IN ({subquery})
+              AND pf.main_keyword IS NOT NULL AND pf.main_keyword <> ''
+            ORDER BY pf.main_keyword
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, params + [offset, pagesize])
+
+        return _json_response({
+            "pageno": pageno, "pagesize": pagesize,
+            "totalcount": totalcount, "totalpages": totalpages,
+            "mainkeywords": [r["main_keyword"] for r in mk_rows]
+        })
+
+    except Exception as e:
+        logger.exception("keywords_mainkeywords error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 3. POST /api/v1/keywords/count
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/keywords/count", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def keywords_count(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    논문 키워드 집계 수 조회
+
+    Request Body:
+      {
+        "mainkeyword": "zein",              // 필수
+        "keywords": ["nanoparticle"],       // 선택, AND 조건
+        "year_start": 2020,                 // 선택
+        "year_end": 2024,                   // 선택
+        "journal": "Nature",                // 선택, exact
+        "publication_type": "Article",      // 선택, exact
+        "result_category": ["formulation"]  // 선택, [] = 전체
+      }
+
+    Response:
+      { "count": 10 }
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    mainkeyword      = body.get("mainkeyword", "").strip()
+    keywords         = body.get("keywords", [])
+    year_start       = body.get("year_start")
+    year_end         = body.get("year_end")
+    journal          = body.get("journal", "").strip() or None
+    publication_type = body.get("publication_type", "").strip() or None
+    result_category  = body.get("result_category", [])
+
+    if not mainkeyword:
+        return _error_response("mainkeyword는 필수입니다.", 400)
+
+    try:
+        subquery, params = _build_paper_filter(
+            mainkeyword=mainkeyword, keywords=keywords,
+            year_start=year_start, year_end=year_end,
+            journal=journal, publication_type=publication_type
+        )
+
+        cat_condition = ""
+        if result_category:
+            placeholders = ", ".join(["?" for _ in result_category])
+            cat_condition = f"AND pkb.keyword_type IN ({placeholders})"
+            params = params + result_category
+
+        count = execute_scalar(f"""
+            SELECT COUNT(pkb.keyword_id)
+            FROM gold.paper_keyword_bridge pkb
+            WHERE pkb.paper_id IN ({subquery})
+            {cat_condition}
+        """, params)
+
+        return _json_response({"count": count})
+
+    except Exception as e:
+        logger.exception("keywords_count error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 4. POST /api/v1/keywords/list
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/keywords/list", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def keywords_list(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    논문 키워드 집계 목록 조회
+
+    Request Body:
+      {
+        "mainkeyword": "zein",              // 필수
+        "keywords": ["nanoparticle"],       // 선택, AND 조건
+        "pageno": 1, "pagesize": 20,
+        "year_start": 2020, "year_end": 2024,
+        "journal": "Nature",
+        "publication_type": "Article",
+        "result_category": ["formulation"]  // [] = 전체
+      }
+
+    Response:
+      {
+        "pageno": 1, "pagesize": 2, "totalcount": 5, "totalpages": 3,
+        "keywords": [
+          { "keyword": "nanoparticle", "categories": ["formulation"], "papers": 5 },
+          ...
+        ]
+      }
+      totalcount: 매칭 논문 수
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    mainkeyword      = body.get("mainkeyword", "").strip()
+    keywords         = body.get("keywords", [])
+    pageno           = _safe_int(body.get("pageno"),   1,  min_val=1)
+    pagesize         = _safe_int(body.get("pagesize"), 20, min_val=1, max_val=100)
+    year_start       = body.get("year_start")
+    year_end         = body.get("year_end")
+    journal          = body.get("journal", "").strip() or None
+    publication_type = body.get("publication_type", "").strip() or None
+    result_category  = body.get("result_category", [])
+    offset           = (pageno - 1) * pagesize
+
+    if not mainkeyword:
+        return _error_response("mainkeyword는 필수입니다.", 400)
+
+    try:
+        subquery, base_params = _build_paper_filter(
+            mainkeyword=mainkeyword, keywords=keywords,
+            year_start=year_start, year_end=year_end,
+            journal=journal, publication_type=publication_type
+        )
+
+        totalcount = execute_scalar(
+            f"SELECT COUNT(*) FROM ({subquery}) AS t", base_params
+        )
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
+
+        cat_condition = ""
+        cat_params = []
+        if result_category:
+            placeholders = ", ".join(["?" for _ in result_category])
+            cat_condition = f"AND pkb.keyword_type IN ({placeholders})"
+            cat_params = result_category
+
+        # 키워드별 논문 수 집계
+        kw_rows = execute_query(f"""
+            SELECT
+                kd.keyword_text,
+                COUNT(DISTINCT pkb.paper_id) AS paper_count
+            FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+            WHERE pkb.paper_id IN ({subquery})
+                AND kd.keyword_text IS NOT NULL        -- ← 추가
+                AND kd.keyword_text <> ''             -- ← 추가
+            {cat_condition}
+            GROUP BY kd.keyword_text
+            ORDER BY paper_count DESC, kd.keyword_text
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, base_params + cat_params + [offset, pagesize])
+
+        # 각 키워드의 categories
+        result_keywords = []
+        for row in kw_rows:
+            kw_text = row["keyword_text"]
+            cat_rows = execute_query(f"""
+                SELECT DISTINCT pkb.keyword_type
+                FROM gold.paper_keyword_bridge pkb
+                INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+                WHERE kd.keyword_text = ?
+                  AND pkb.paper_id IN ({subquery})
+                ORDER BY pkb.keyword_type
+            """, [kw_text] + base_params)
+            result_keywords.append({
+                "keyword":    kw_text,
+                "categories": [r["keyword_type"] for r in cat_rows],
+                "papers":     row["paper_count"]
+            })
+
+        return _json_response({
+            "pageno": pageno, "pagesize": pagesize,
+            "totalcount": totalcount, "totalpages": totalpages,
+            "keywords": result_keywords
+        })
+
+    except Exception as e:
+        logger.exception("keywords_list error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 5. POST /api/v1/papers/search
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/papers/search", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def papers_search(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    논문 목록 조회
+
+    Request Body:
+      {
+        "mainkeyword": "zein",                   // 필수
+        "keywords": ["nanoparticle"],            // 선택, AND 조건
+        "sort_title":   true,                    // 선택 (true=ASC, false=DESC)
+        "sort_journal": true,                    // 선택
+        "sort_year":    false,                   // 선택 (기본 미지정시 최신순)
+        "pageno": 1, "pagesize": 20
+      }
+
+    Response:
+      {
+        "pageno": 1, "pagesize": 2, "totalcount": 7, "totalpages": 4,
+        "papers": [
+          { "paperid": "doi:10.xxx", "title": "...", "journal": "...", "year": 2024 },
+          ...
+        ]
+      }
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    mainkeyword  = body.get("mainkeyword", "").strip()
+    keywords     = body.get("keywords", [])
+    sort_title   = body.get("sort_title")
+    sort_journal = body.get("sort_journal")
+    sort_year    = body.get("sort_year")
+    pageno       = _safe_int(body.get("pageno"),   1,  min_val=1)
+    pagesize     = _safe_int(body.get("pagesize"), 20, min_val=1, max_val=100)
+    offset       = (pageno - 1) * pagesize
+
+    if not mainkeyword:
+        return _error_response("mainkeyword는 필수입니다.", 400)
+
+    try:
+        subquery, params = _build_paper_filter(
+            mainkeyword=mainkeyword, keywords=keywords
+        )
+
+        totalcount = execute_scalar(
+            f"SELECT COUNT(*) FROM ({subquery}) AS t", params
+        )
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
+
+        # 정렬 조건
+        order_parts = []
+        if sort_title   is not None: order_parts.append(f"pf.title {'ASC' if sort_title else 'DESC'}")
+        if sort_journal is not None: order_parts.append(f"pf.journal_name {'ASC' if sort_journal else 'DESC'}")
+        if sort_year    is not None: order_parts.append(f"pf.published_year {'ASC' if sort_year else 'DESC'}")
+        if not order_parts:          order_parts.append("pf.published_year DESC")
+        order_clause = "ORDER BY " + ", ".join(order_parts)
+
+        papers = execute_query(f"""
+            SELECT
+                pf.paper_id        AS paperid,
+                pf.title,
+                pf.journal_name    AS journal,
+                pf.published_year  AS year
+            FROM gold.paper_fact pf
+            WHERE pf.paper_id IN ({subquery})
+            {order_clause}
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, params + [offset, pagesize])
+
+        return _json_response({
+            "pageno": pageno, "pagesize": pagesize,
+            "totalcount": totalcount, "totalpages": totalpages,
+            "papers": papers
+        })
+
+    except Exception as e:
+        logger.exception("papers_search error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 6. POST /api/v1/papers/detail
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/papers/detail", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def papers_detail(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    논문 상세 조회 (메타 + 카테고리별 키워드)
+
+    Request Body:
+      { "paperid": "doi:10.xxx" }   // paperid 또는 title 중 1개 이상 필수
+      { "title": "Zein nanoparticles..." }
+
+    Response:
+      {
+        "paperid": "...", "title": "...", "doi": "...", "abstract": "...",
+        "year": 2024, "journal": "...",
+        "authors": ["John Smith", "Emily Johnson"],
+        "main_keyword": "zein",
+        "main_material": ["zein"],
+        "active_ingredient": ["THC"],
+        "formulation": ["nanoparticle"],
+        "application": ["cosmetic"],
+        "fabrication_method": ["co-assembly"],
+        "analysis_method": ["cell model"],
+        "efficacy": ["anti-photoaging"],
+        "binding_component": ["HA"],
+        "cell_type": [],
+        "stimulus": [],
+        "key_molecule": [],
+        "signaling_pathway": [],
+        "etcs": ["UVB", "GRAS"]
+      }
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    paperid = body.get("paperid", "").strip()
+    title   = body.get("title",   "").strip()
+
+    if not paperid and not title:
+        return _error_response("paperid 또는 title 중 하나는 필수입니다.", 400)
+
+    try:
+        # 논문 기본 정보
+        if paperid:
+            papers = execute_query("""
+                SELECT paper_id, doi, title, abstract, published_year,
+                       journal_name, main_keyword, publication_type, main_material
+                FROM gold.paper_fact WHERE paper_id = ?
+            """, [paperid])
+        else:
+            papers = execute_query("""
+                SELECT paper_id, doi, title, abstract, published_year,
+                       journal_name, main_keyword, publication_type, main_material
+                FROM gold.paper_fact WHERE title = ?
+            """, [title])
+
+        if not papers:
+            return _error_response("논문을 찾을 수 없습니다.", 404)
+
+        paper = papers[0]
+        pid   = paper["paper_id"]
+
+        # 저자 목록
+        author_rows = execute_query("""
+            SELECT pad.author_name
+            FROM gold.paper_author_bridge pab
+            INNER JOIN gold.paper_author_dim pad ON pab.author_key = pad.author_key
+            WHERE pab.paper_id = ?
+            ORDER BY pab.author_seq
+        """, [pid])
+        authors = [r["author_name"] for r in author_rows]
+
+        # 카테고리별 키워드
+        keyword_rows = execute_query("""
+            SELECT pkb.keyword_type, kd.keyword_text
+            FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+            WHERE pkb.paper_id = ?
+            ORDER BY pkb.keyword_type, pkb.weight DESC
+        """, [pid])
+
+        # 카테고리별 그룹화 (설계서 정의 순서)
+        CATEGORIES = [
+            "main_material", "active_ingredient", "formulation",
+            "application", "fabrication_method", "analysis_method",
+            "efficacy", "binding_component", "cell_type",
+            "stimulus", "key_molecule", "signaling_pathway", "etcs"
+        ]
+        cat_map = {cat: [] for cat in CATEGORIES}
+        for row in keyword_rows:
+            kt = row["keyword_type"]
+            kw = row["keyword_text"]
+            if kt in cat_map and kw not in cat_map[kt]:
+                cat_map[kt].append(kw)
+
+        result = {
+            "paperid":      pid,
+            "title":        paper["title"],
+            "doi":          paper["doi"],
+            "abstract":     paper["abstract"],
+            "year":         paper["published_year"],
+            "journal":      paper["journal_name"],
+            "authors":      authors,
+            "main_keyword": paper["main_keyword"],
+        }
+        for cat in CATEGORIES:
+            result[cat] = cat_map[cat]
+
+        return _json_response(result)
+
+    except Exception as e:
+        logger.exception("papers_detail error")
+        return _error_response(str(e), 500)
