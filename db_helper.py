@@ -33,8 +33,8 @@ def get_connection() -> pyodbc.Connection:
     환경변수: FABRIC_SQL_ENDPOINT, FABRIC_DATABASE
     """
     endpoint = os.environ["FABRIC_SQL_ENDPOINT"]
-    database = os.environ["FABRIC_DATABASE"]          # BUG FIX: FABRIC_DB_NAME → FABRIC_DATABASE
-
+    database = os.environ["FABRIC_DB_NAME"]         
+    
     conn_str = (
         "Driver={ODBC Driver 18 for SQL Server};"
         f"Server={endpoint},1433;"
