@@ -53,9 +53,10 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}        # 변경
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}        # 변경
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}  # 변경
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID }}
+          auth-type: OIDC   
 
       - name: Create Blob container if not exists
         uses: azure/CLI@v2
