@@ -24,6 +24,8 @@ Gold Layer 테이블:
 
 import json
 import logging
+from collections import defaultdict
+
 import azure.functions as func
 from db_helper import execute_query, execute_scalar
 
@@ -102,7 +104,6 @@ def _build_paper_filter(
         params.append(publication_type)
 
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
     base_sql = f"SELECT pf.paper_id FROM gold.paper_fact pf {where_clause}"
 
     if not keywords:
@@ -164,28 +165,33 @@ def keywords_search(req: func.HttpRequest) -> func.HttpResponse:
 
         totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
-        kw_rows = execute_query("""
-            SELECT DISTINCT kd.keyword_text
+        # [BUG FIX] N+1 쿼리 제거: keyword + category를 한 번의 JOIN 쿼리로 조회
+        # 기존: 키워드마다 루프로 categories 별도 조회 (페이지당 최대 100회 DB 호출)
+        # 수정: keyword_dim + paper_keyword_bridge JOIN으로 한 번에 조회 후 Python groupby
+        kw_cat_rows = execute_query("""
+            SELECT DISTINCT kd.keyword_text, pkb.keyword_type
             FROM gold.keyword_dim kd
+            LEFT JOIN gold.paper_keyword_bridge pkb ON kd.keyword_id = pkb.keyword_id
             WHERE kd.keyword_text LIKE ? OR kd.normalized_text LIKE ?
-            ORDER BY kd.keyword_text
-            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-        """, [pattern, pattern, offset, pagesize])
+            ORDER BY kd.keyword_text, pkb.keyword_type
+        """, [pattern, pattern])
 
-        items = []
-        for row in kw_rows:
-            kw_text = row["keyword_text"]
-            cat_rows = execute_query("""
-                SELECT DISTINCT pkb.keyword_type
-                FROM gold.paper_keyword_bridge pkb
-                INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
-                WHERE kd.keyword_text = ?
-                ORDER BY pkb.keyword_type
-            """, [kw_text])
-            items.append({
-                "keyword": kw_text,
-                "categories": [r["keyword_type"] for r in cat_rows]
-            })
+        # Python에서 keyword 기준으로 groupby 후 페이징 처리
+        kw_map = defaultdict(list)
+        for row in kw_cat_rows:
+            kw = row["keyword_text"]
+            kt = row["keyword_type"]
+            if kt and kt not in kw_map[kw]:
+                kw_map[kw].append(kt)
+
+        # 정렬 후 페이징
+        sorted_keywords = sorted(kw_map.keys())
+        paged_keywords  = sorted_keywords[offset: offset + pagesize]
+
+        items = [
+            {"keyword": kw, "categories": kw_map[kw]}
+            for kw in paged_keywords
+        ]
 
         return _json_response({
             "pageno": pageno, "pagesize": pagesize,
@@ -237,8 +243,9 @@ def keywords_mainkeywords(req: func.HttpRequest) -> func.HttpResponse:
         subquery, params = _build_paper_filter(keywords=keywords)
 
         # totalcount: 조건 만족 논문 수
+        # [BUG FIX] params를 COUNT 쿼리와 SELECT 쿼리에 각각 독립적으로 전달
         totalcount = execute_scalar(
-            f"SELECT COUNT(*) FROM ({subquery}) AS t", params
+            f"SELECT COUNT(*) FROM ({subquery}) AS t", list(params)
         )
         totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
@@ -250,7 +257,7 @@ def keywords_mainkeywords(req: func.HttpRequest) -> func.HttpResponse:
               AND pf.main_keyword IS NOT NULL AND pf.main_keyword <> ''
             ORDER BY pf.main_keyword
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-        """, params + [offset, pagesize])
+        """, list(params) + [offset, pagesize])
 
         return _json_response({
             "pageno": pageno, "pagesize": pagesize,
@@ -308,18 +315,21 @@ def keywords_count(req: func.HttpRequest) -> func.HttpResponse:
             journal=journal, publication_type=publication_type
         )
 
+        # [BUG FIX] params를 list()로 복사해서 원본 변형 방지
+        query_params = list(params)
+
         cat_condition = ""
         if result_category:
-            placeholders = ", ".join(["?" for _ in result_category])
+            placeholders  = ", ".join(["?" for _ in result_category])
             cat_condition = f"AND pkb.keyword_type IN ({placeholders})"
-            params = params + result_category
+            query_params  = query_params + list(result_category)
 
         count = execute_scalar(f"""
             SELECT COUNT(pkb.keyword_id)
             FROM gold.paper_keyword_bridge pkb
             WHERE pkb.paper_id IN ({subquery})
             {cat_condition}
-        """, params)
+        """, query_params)
 
         return _json_response({"count": count})
 
@@ -383,17 +393,18 @@ def keywords_list(req: func.HttpRequest) -> func.HttpResponse:
             journal=journal, publication_type=publication_type
         )
 
+        # [BUG FIX] base_params를 list()로 복사해서 COUNT/SELECT 쿼리에 독립 전달
         totalcount = execute_scalar(
-            f"SELECT COUNT(*) FROM ({subquery}) AS t", base_params
+            f"SELECT COUNT(*) FROM ({subquery}) AS t", list(base_params)
         )
         totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
         cat_condition = ""
-        cat_params = []
+        cat_params    = []
         if result_category:
-            placeholders = ", ".join(["?" for _ in result_category])
+            placeholders  = ", ".join(["?" for _ in result_category])
             cat_condition = f"AND pkb.keyword_type IN ({placeholders})"
-            cat_params = result_category
+            cat_params    = list(result_category)
 
         # 키워드별 논문 수 집계
         kw_rows = execute_query(f"""
@@ -403,31 +414,48 @@ def keywords_list(req: func.HttpRequest) -> func.HttpResponse:
             FROM gold.paper_keyword_bridge pkb
             INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
             WHERE pkb.paper_id IN ({subquery})
-                AND kd.keyword_text IS NOT NULL        -- ← 추가
-                AND kd.keyword_text <> ''             -- ← 추가
+              AND kd.keyword_text IS NOT NULL
+              AND kd.keyword_text <> ''
             {cat_condition}
             GROUP BY kd.keyword_text
             ORDER BY paper_count DESC, kd.keyword_text
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-        """, base_params + cat_params + [offset, pagesize])
+        """, list(base_params) + cat_params + [offset, pagesize])
 
-        # 각 키워드의 categories
+        # [BUG FIX] N+1 쿼리 제거: 키워드 목록의 categories를 한 번의 쿼리로 조회
+        # 기존: 키워드마다 루프로 categories 별도 조회
+        # 수정: 키워드 목록을 IN 절로 한 번에 조회 후 Python groupby
         result_keywords = []
-        for row in kw_rows:
-            kw_text = row["keyword_text"]
+        if kw_rows:
+            kw_texts     = [row["keyword_text"] for row in kw_rows]
+            paper_counts = {row["keyword_text"]: row["paper_count"] for row in kw_rows}
+
+            placeholders = ", ".join(["?" for _ in kw_texts])
             cat_rows = execute_query(f"""
-                SELECT DISTINCT pkb.keyword_type
+                SELECT DISTINCT kd.keyword_text, pkb.keyword_type
                 FROM gold.paper_keyword_bridge pkb
                 INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
-                WHERE kd.keyword_text = ?
+                WHERE kd.keyword_text IN ({placeholders})
                   AND pkb.paper_id IN ({subquery})
-                ORDER BY pkb.keyword_type
-            """, [kw_text] + base_params)
-            result_keywords.append({
-                "keyword":    kw_text,
-                "categories": [r["keyword_type"] for r in cat_rows],
-                "papers":     row["paper_count"]
-            })
+                ORDER BY kd.keyword_text, pkb.keyword_type
+            """, kw_texts + list(base_params))
+
+            cat_map = defaultdict(list)
+            for row in cat_rows:
+                kw = row["keyword_text"]
+                kt = row["keyword_type"]
+                if kt and kt not in cat_map[kw]:
+                    cat_map[kw].append(kt)
+
+            # kw_rows 순서 유지 (paper_count DESC 정렬)
+            result_keywords = [
+                {
+                    "keyword":    kw,
+                    "categories": cat_map.get(kw, []),
+                    "papers":     paper_counts[kw]
+                }
+                for kw in kw_texts
+            ]
 
         return _json_response({
             "pageno": pageno, "pagesize": pagesize,
@@ -489,8 +517,10 @@ def papers_search(req: func.HttpRequest) -> func.HttpResponse:
             mainkeyword=mainkeyword, keywords=keywords
         )
 
+        # [BUG FIX] params를 list()로 복사해서 COUNT/SELECT 쿼리에 독립 전달
+        # 기존: params + [offset, pagesize] 시 subquery 안의 params가 2번 전달되는 버그
         totalcount = execute_scalar(
-            f"SELECT COUNT(*) FROM ({subquery}) AS t", params
+            f"SELECT COUNT(*) FROM ({subquery}) AS t", list(params)
         )
         totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
@@ -512,7 +542,7 @@ def papers_search(req: func.HttpRequest) -> func.HttpResponse:
             WHERE pf.paper_id IN ({subquery})
             {order_clause}
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-        """, params + [offset, pagesize])
+        """, list(params) + [offset, pagesize])
 
         return _json_response({
             "pageno": pageno, "pagesize": pagesize,
@@ -600,7 +630,7 @@ def papers_detail(req: func.HttpRequest) -> func.HttpResponse:
         """, [pid])
         authors = [r["author_name"] for r in author_rows]
 
-        # 카테고리별 키워드
+        # 카테고리별 키워드 (한 번의 쿼리로 전체 조회)
         keyword_rows = execute_query("""
             SELECT pkb.keyword_type, kd.keyword_text
             FROM gold.paper_keyword_bridge pkb
