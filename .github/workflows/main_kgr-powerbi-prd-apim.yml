@@ -1,6 +1,6 @@
 # Docs for the Azure Web Apps Deploy action: https://github.com/azure/functions-action
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-# More info on Python, GitHub Actions, and Azure Functions: https://aka.ms/python-webapps-actions
+# Private Endpoint 환경: Blob Storage 경유 배포 방식 적용
+# WEBSITE_RUN_FROM_PACKAGE 로 Function App이 내부에서 패키지를 당겨가는 방식
 
 name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim
 
@@ -11,14 +11,18 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.' # set this to the path to your web app project, defaults to the repository root
-  PYTHON_VERSION: '3.10' # set this to the python version to use (supports 3.6, 3.7, 3.8)
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
+  PYTHON_VERSION: '3.10'
+  STORAGE_ACCOUNT_NAME: 'kolmarbistr'        # Function App 연결 Storage
+  BLOB_CONTAINER_NAME: 'deployments'         # 배포용 컨테이너 (없으면 자동 생성)
+  PACKAGE_NAME: 'kgr-powerbi-prd-apim.zip'  # 배포 패키지 파일명
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -29,45 +33,23 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Create and start virtual environment
+      - name: Install dependencies
         run: |
           python -m venv venv
           source venv/bin/activate
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # Optional: Add step to run tests here
+          pip install -r requirements.txt
 
       - name: Zip artifact for deployment
-        run: zip release.zip ./* -r
-
-      - name: Upload artifact for deployment job
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-app
-          path: |
-            release.zip
-            !venv/
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
-
-    steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: python-app
-
-      - name: Unzip artifact for deployment
         run: |
-          unzip release.zip
-          rm release.zip
-        
+          zip -r ${{ env.PACKAGE_NAME }} . \
+            --exclude "*.git*" \
+            --exclude "venv/*" \
+            --exclude ".venv/*" \
+            --exclude "__pycache__/*" \
+            --exclude "*.pyc" \
+            --exclude "local.settings.json" \
+            --exclude "deploy.zip"
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -75,11 +57,65 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_1B5F1A1FE16849C0AAD9784418CC8BDE }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D49A98D44D5A4D4CACC6BB70A14E0249 }}
 
-      - name: 'Deploy to Azure Functions'
-        uses: Azure/functions-action@v1
-        id: deploy-to-function
+      - name: Create Blob container if not exists
+        uses: azure/CLI@v2
         with:
-          app-name: 'kgr-powerbi-prd-apim'
-          slot-name: 'Production'
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          
+          azcliversion: latest
+          inlineScript: |
+            az storage container create \
+              --name ${{ env.BLOB_CONTAINER_NAME }} \
+              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --auth-mode login \
+              --public-access off \
+              || true
+
+      - name: Upload package to Blob Storage
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az storage blob upload \
+              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --container-name ${{ env.BLOB_CONTAINER_NAME }} \
+              --name ${{ env.PACKAGE_NAME }} \
+              --file ${{ env.PACKAGE_NAME }} \
+              --auth-mode login \
+              --overwrite true
+
+      - name: Generate SAS URL for package
+        uses: azure/CLI@v2
+        id: sas
+        with:
+          azcliversion: latest
+          inlineScript: |
+            EXPIRY=$(date -u -d "2 hours" '+%Y-%m-%dT%H:%MZ')
+            SAS_URL=$(az storage blob generate-sas \
+              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --container-name ${{ env.BLOB_CONTAINER_NAME }} \
+              --name ${{ env.PACKAGE_NAME }} \
+              --permissions r \
+              --expiry $EXPIRY \
+              --auth-mode login \
+              --as-user \
+              --full-uri \
+              --output tsv)
+            echo "sas_url=$SAS_URL" >> $GITHUB_OUTPUT
+
+      - name: Set WEBSITE_RUN_FROM_PACKAGE
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az functionapp config appsettings set \
+              --name kgr-powerbi-prd-apim \
+              --resource-group KOLMAR-BI \
+              --settings WEBSITE_RUN_FROM_PACKAGE="${{ steps.sas.outputs.sas_url }}"
+
+      - name: Restart Function App to apply new package
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az functionapp restart \
+              --name kgr-powerbi-prd-apim \
+              --resource-group KOLMAR-BI
