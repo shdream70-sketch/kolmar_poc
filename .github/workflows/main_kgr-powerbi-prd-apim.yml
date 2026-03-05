@@ -35,15 +35,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install -r requirements.txt
+          pip install --target=".python_packages/lib/site-packages" -r requirements.txt
 
       - name: Zip artifact for deployment
         run: |
           zip -r ${{ env.PACKAGE_NAME }} . \
             --exclude "*.git*" \
-            --exclude "venv/*" \
             --exclude ".venv/*" \
             --exclude "__pycache__/*" \
             --exclude "*.pyc" \
