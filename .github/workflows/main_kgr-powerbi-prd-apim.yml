@@ -53,9 +53,9 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_FB9147FFC5FD4210B910CF3E5BF22ED4 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_1B5F1A1FE16849C0AAD9784418CC8BDE }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D49A98D44D5A4D4CACC6BB70A14E0249 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID }}
 
       - name: Create Blob container if not exists
         uses: azure/CLI@v2
