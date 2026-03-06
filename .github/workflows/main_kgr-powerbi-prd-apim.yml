@@ -1,7 +1,3 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/azure/functions-action
-# Private Endpoint 환경: Blob Storage 경유 배포 방식 적용
-# WEBSITE_RUN_FROM_PACKAGE 로 Function App이 내부에서 패키지를 당겨가는 방식
-
 name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim
 
 on:
@@ -11,11 +7,9 @@ on:
   workflow_dispatch:
 
 env:
+  AZURE_FUNCTIONAPP_NAME: 'kgr-powerbi-prd-apim'
   AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
   PYTHON_VERSION: '3.10'
-  STORAGE_ACCOUNT_NAME: 'kolmarbistr'        # Function App 연결 Storage
-  BLOB_CONTAINER_NAME: 'deployments'         # 배포용 컨테이너 (없으면 자동 생성)
-  PACKAGE_NAME: 'kgr-powerbi-prd-apim.zip'  # 배포 패키지 파일명
 
 jobs:
   build-and-deploy:
@@ -35,91 +29,20 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install --target=".python_packages/lib/site-packages" -r requirements.txt
 
-      - name: Zip artifact for deployment
-        run: |
-          zip -r ${{ env.PACKAGE_NAME }} . \
-            --exclude "*.git*" \
-            --exclude ".venv/*" \
-            --exclude "__pycache__/*" \
-            --exclude "*.pyc" \
-            --exclude "local.settings.json" \
-            --exclude "deploy.zip"
-
-      - name: Login to Azure
+      - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID }}
-          
-      - name: Create Blob container if not exists
-        uses: azure/CLI@v2
-        with:
-          azcliversion: latest
-          inlineScript: |
-            az storage container create \
-              --name ${{ env.BLOB_CONTAINER_NAME }} \
-              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
-              --auth-mode login \
-              --public-access off \
-              || true
 
-      - name: Upload package to Blob Storage
-        uses: azure/CLI@v2
+      - name: Deploy to Azure Functions
+        uses: Azure/functions-action@v1
         with:
-          azcliversion: latest
-          inlineScript: |
-            az storage blob upload \
-              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
-              --container-name ${{ env.BLOB_CONTAINER_NAME }} \
-              --name ${{ env.PACKAGE_NAME }} \
-              --file ${{ env.PACKAGE_NAME }} \
-              --auth-mode login \
-              --overwrite true
-
-      - name: Generate SAS URL for package
-        uses: azure/CLI@v2
-        id: sas
-        with:
-          azcliversion: latest
-          inlineScript: |
-            ACCOUNT_KEY=$(az storage account keys list \
-              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
-              --resource-group KOLMAR-BI \
-              --query "[0].value" \
-              --output tsv)
-            
-            EXPIRY=$(date -u -d "8760 hours" '+%Y-%m-%dT%H:%MZ')
-            
-            SAS_URL=$(az storage blob generate-sas \
-              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
-              --account-key "$ACCOUNT_KEY" \
-              --container-name ${{ env.BLOB_CONTAINER_NAME }} \
-              --name ${{ env.PACKAGE_NAME }} \
-              --permissions r \
-              --expiry $EXPIRY \
-              --full-uri \
-              --output tsv)
-            
-            echo "sas_url=$SAS_URL" >> $GITHUB_OUTPUT
-
-      - name: Set WEBSITE_RUN_FROM_PACKAGE
-        uses: azure/CLI@v2
-        with:
-          azcliversion: latest
-          inlineScript: |
-            az functionapp config appsettings set \
-              --name kgr-powerbi-prd-apim \
-              --resource-group KOLMAR-BI \
-              --settings WEBSITE_RUN_FROM_PACKAGE="${{ steps.sas.outputs.sas_url }}"
-
-      - name: Restart Function App to apply new package
-        uses: azure/CLI@v2
-        with:
-          azcliversion: latest
-          inlineScript: |
-            az functionapp restart \
-              --name kgr-powerbi-prd-apim \
-              --resource-group KOLMAR-BI
+          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          remote-build: false
+          respect-funcignore: true
