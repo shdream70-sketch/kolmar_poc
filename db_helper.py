@@ -18,7 +18,6 @@ def _get_token_bytes() -> bytes:
     Managed Identity(Azure 배포) 또는 DefaultAzureCredential(로컬 az login)으로
     Fabric 접근 토큰을 가져와 pyodbc용 바이트 구조체로 변환
 
-    [BUG FIX] UTF-16-LE 직접 인코딩 방식 → UTF-8 후 null 바이트 삽입 방식으로 수정
     Azure SQL / Fabric Warehouse 공식 인증 방식:
       1. 토큰을 UTF-8로 인코딩
       2. 각 바이트 사이에 null(0x00) 삽입 (Windows UTF-16-LE 에뮬레이션)
@@ -40,10 +39,32 @@ def get_connection() -> pyodbc.Connection:
     """
     Gold Layer Warehouse에 연결된 pyodbc Connection 반환
     환경변수: FABRIC_SQL_ENDPOINT, FABRIC_DB_NAME
+
+    연결 방식:
+      Azure 환경: Authentication=ActiveDirectoryMsi (ODBC 드라이버 내장 MI 인증)
+      로컬 환경: SQL_COPT_SS_ACCESS_TOKEN (DefaultAzureCredential → az login 토큰)
     """
     endpoint = os.environ["FABRIC_SQL_ENDPOINT"]
     database = os.environ["FABRIC_DB_NAME"]
 
+    # Azure 환경 (Managed Identity): ActiveDirectoryMsi
+    conn_str_msi = (
+        "Driver={ODBC Driver 18 for SQL Server};"
+        f"Server={endpoint},1433;"
+        f"Database={database};"
+        "Encrypt=Yes;"
+        "TrustServerCertificate=No;"
+        "Authentication=ActiveDirectoryMsi;"
+        "Connection Timeout=30;"
+    )
+    try:
+        conn = pyodbc.connect(conn_str_msi)
+        conn.autocommit = True
+        return conn
+    except pyodbc.Error as e:
+        logger.warning("ActiveDirectoryMsi 연결 실패, 토큰 방식으로 재시도: %s", e)
+
+    # 로컬/대체 환경: 수동 토큰 (DefaultAzureCredential)
     conn_str = (
         "Driver={ODBC Driver 18 for SQL Server};"
         f"Server={endpoint},1433;"
@@ -52,7 +73,6 @@ def get_connection() -> pyodbc.Connection:
         "TrustServerCertificate=No;"
         "Connection Timeout=30;"
     )
-
     conn = pyodbc.connect(
         conn_str,
         attrs_before={SQL_COPT_SS_ACCESS_TOKEN: _get_token_bytes()}

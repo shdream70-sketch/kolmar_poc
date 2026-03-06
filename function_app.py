@@ -1,32 +1,15 @@
-"""
-Azure Functions v2 - KGR Keywords & Papers API
-인터페이스 설계서 v1.2 (20260219) 기반 구현
-
-API 목록:
-  1. GET  /api/v1/keywords/search       키워드 Like 검색
-  2. POST /api/v1/keywords/mainkeywords main_keyword 목록 조회
-  3. POST /api/v1/keywords/count        논문 키워드 집계 수 조회
-  4. POST /api/v1/keywords/list         논문 키워드 집계 목록 조회
-  5. POST /api/v1/papers/search         논문 목록 조회
-  6. POST /api/v1/papers/detail         논문 상세 조회
-
-Gold Layer 테이블:
-  gold.keyword_dim          : keyword_id, keyword_text, normalized_text, created_at
-  gold.keyword_type_map     : keyword_id, keyword_type, source, is_active, ...
-  gold.paper_fact           : paper_id, doi, title, abstract, published_year,
-                              journal_name, paper_url, open_access_pdf_url,
-                              main_keyword, publication_type, main_material, ...
-  gold.paper_keyword_bridge : paper_id, keyword_id, keyword_type, role,
-                              weight, extracted_by, confidence, created_at
-  gold.paper_author_dim     : author_key, author_name, created_at
-  gold.paper_author_bridge  : paper_id, author_key, author_seq
-"""
-
+import sys as _sys
+import os as _os
 import json
 import logging
 from collections import defaultdict
 
 import azure.functions as func
+
+_pkg_path = _os.path.join(_os.path.dirname(__file__), '.python_packages', 'lib', 'site-packages')
+if _pkg_path not in _sys.path:
+    _sys.path.insert(0, _pkg_path)
+
 from db_helper import execute_query, execute_scalar
 
 app = func.FunctionApp()

@@ -1,5 +1,7 @@
-# Flex Consumption 배포 방식: Blob Storage 경유
-# WEBSITE_RUN_FROM_PACKAGE 로 Function App이 내부에서 패키지를 당겨가는 방식
+# Flex Consumption 배포 방식: Kudu /api/publish?type=zip
+# Ubuntu에서 빌드한 zip을 Azure AD Bearer 토큰으로 Kudu에 직접 업로드
+# 이유: WEBSITE_RUN_FROM_PACKAGE 방식은 zip 내 파일 권한이 0으로 설정되어
+#       Linux 컨테이너에서 /home/site/wwwroot 파일을 읽지 못하는 문제 발생
 
 name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim
 
@@ -10,11 +12,10 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
   PYTHON_VERSION: '3.10'
-  STORAGE_ACCOUNT_NAME: 'kolmarbistr'
-  BLOB_CONTAINER_NAME: 'deployments'
-  PACKAGE_NAME: 'kgr-powerbi-prd-apim.zip'
+  FUNCTIONAPP_NAME: 'kgr-powerbi-prd-apim'
+  RESOURCE_GROUP: 'KOLMAR-BI'
+  KUDU_URL: 'https://kgr-powerbi-prd-apim-ephqhvf6g6erchbt.scm.koreacentral-01.azurewebsites.net'
 
 jobs:
   build-and-deploy:
@@ -37,13 +38,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unixodbc-dev
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           pip install --target=".python_packages/lib/site-packages" -r requirements.txt
 
       - name: Zip artifact for deployment
         run: |
-          zip -r ${{ env.PACKAGE_NAME }} . \
+          zip -r deployment.zip . \
             --exclude "*.git*" \
             --exclude ".venv/*" \
             --exclude "__pycache__/*" \
@@ -57,52 +58,16 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID }}
 
-      - name: Upload package to Blob Storage
+      - name: Deploy to Function App via Kudu
         uses: azure/CLI@v2
         with:
           azcliversion: latest
           inlineScript: |
-            az storage blob upload \
-              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
-              --container-name ${{ env.BLOB_CONTAINER_NAME }} \
-              --name ${{ env.PACKAGE_NAME }} \
-              --file ${{ env.PACKAGE_NAME }} \
-              --auth-mode login \
-              --overwrite true
-
-      - name: Generate SAS URL and set WEBSITE_RUN_FROM_PACKAGE
-        uses: azure/CLI@v2
-        with:
-          azcliversion: latest
-          inlineScript: |
-            ACCOUNT_KEY=$(az storage account keys list \
-              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
-              --resource-group KOLMAR-BI \
-              --query "[0].value" \
-              --output tsv)
-
-            EXPIRY=$(date -u -d "8760 hours" '+%Y-%m-%dT%H:%MZ')
-
-            SAS_URL=$(az storage blob generate-sas \
-              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
-              --account-key "$ACCOUNT_KEY" \
-              --container-name ${{ env.BLOB_CONTAINER_NAME }} \
-              --name ${{ env.PACKAGE_NAME }} \
-              --permissions r \
-              --expiry $EXPIRY \
-              --full-uri \
-              --output tsv)
-
-            az functionapp config appsettings set \
-              --name kgr-powerbi-prd-apim \
-              --resource-group KOLMAR-BI \
-              --settings "WEBSITE_RUN_FROM_PACKAGE=$SAS_URL"
-
-      - name: Restart Function App
-        uses: azure/CLI@v2
-        with:
-          azcliversion: latest
-          inlineScript: |
-            az functionapp restart \
-              --name kgr-powerbi-prd-apim \
-              --resource-group KOLMAR-BI
+            TOKEN=$(az account get-access-token --resource "https://management.azure.com/" --query "accessToken" -o tsv)
+            curl -X POST \
+              "${{ env.KUDU_URL }}/api/publish?type=zip" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/zip" \
+              --data-binary @deployment.zip \
+              --fail \
+              --show-error
