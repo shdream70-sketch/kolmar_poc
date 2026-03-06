@@ -1,3 +1,5 @@
+# This workflow builds and deploys a Python project to an Azure Function App named 'kgr-powerbi-prd-apim'.
+
 name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim
 
 on:
