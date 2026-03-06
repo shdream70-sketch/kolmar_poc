@@ -1,4 +1,5 @@
-# This workflow builds and deploys a Python project to an Azure Function App named 'kgr-powerbi-prd-apim'.
+# Flex Consumption 배포 방식: Blob Storage 경유
+# WEBSITE_RUN_FROM_PACKAGE 로 Function App이 내부에서 패키지를 당겨가는 방식
 
 name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim
 
@@ -9,9 +10,11 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_NAME: 'kgr-powerbi-prd-apim'
   AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
   PYTHON_VERSION: '3.10'
+  STORAGE_ACCOUNT_NAME: 'kolmarbistr'
+  BLOB_CONTAINER_NAME: 'deployments'
+  PACKAGE_NAME: 'kgr-powerbi-prd-apim.zip'
 
 jobs:
   build-and-deploy:
@@ -29,18 +32,77 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Azure login (OIDC)
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
+
+      - name: Install dependencies
+        run: |
+          pip install --target=".python_packages/lib/site-packages" -r requirements.txt
+
+      - name: Zip artifact for deployment
+        run: |
+          zip -r ${{ env.PACKAGE_NAME }} . \
+            --exclude "*.git*" \
+            --exclude ".venv/*" \
+            --exclude "__pycache__/*" \
+            --exclude "*.pyc" \
+            --exclude "local.settings.json"
+
+      - name: Login to Azure
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID }}
 
-      - name: Deploy to Azure Functions
-        uses: Azure/functions-action@v1
+      - name: Upload package to Blob Storage
+        uses: azure/CLI@v2
         with:
-          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          sku: flexconsumption
-          scm-do-build-during-deployment: true
-          enable-oryx-build: true
+          azcliversion: latest
+          inlineScript: |
+            az storage blob upload \
+              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --container-name ${{ env.BLOB_CONTAINER_NAME }} \
+              --name ${{ env.PACKAGE_NAME }} \
+              --file ${{ env.PACKAGE_NAME }} \
+              --auth-mode login \
+              --overwrite true
+
+      - name: Generate SAS URL and set WEBSITE_RUN_FROM_PACKAGE
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            ACCOUNT_KEY=$(az storage account keys list \
+              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --resource-group KOLMAR-BI \
+              --query "[0].value" \
+              --output tsv)
+
+            EXPIRY=$(date -u -d "8760 hours" '+%Y-%m-%dT%H:%MZ')
+
+            SAS_URL=$(az storage blob generate-sas \
+              --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --account-key "$ACCOUNT_KEY" \
+              --container-name ${{ env.BLOB_CONTAINER_NAME }} \
+              --name ${{ env.PACKAGE_NAME }} \
+              --permissions r \
+              --expiry $EXPIRY \
+              --full-uri \
+              --output tsv)
+
+            az functionapp config appsettings set \
+              --name kgr-powerbi-prd-apim \
+              --resource-group KOLMAR-BI \
+              --settings "WEBSITE_RUN_FROM_PACKAGE=$SAS_URL"
+
+      - name: Restart Function App
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az functionapp restart \
+              --name kgr-powerbi-prd-apim \
+              --resource-group KOLMAR-BI
