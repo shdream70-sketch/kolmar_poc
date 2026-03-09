@@ -308,9 +308,12 @@ def keywords_count(req: func.HttpRequest) -> func.HttpResponse:
             query_params  = query_params + list(result_category)
 
         count = execute_scalar(f"""
-            SELECT COUNT(pkb.keyword_id)
+            SELECT COUNT(DISTINCT kd.keyword_text)
             FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
             WHERE pkb.paper_id IN ({subquery})
+              AND kd.keyword_text IS NOT NULL
+              AND kd.keyword_text <> ''
             {cat_condition}
         """, query_params)
 
@@ -376,18 +379,24 @@ def keywords_list(req: func.HttpRequest) -> func.HttpResponse:
             journal=journal, publication_type=publication_type
         )
 
-        # [BUG FIX] base_params를 list()로 복사해서 COUNT/SELECT 쿼리에 독립 전달
-        totalcount = execute_scalar(
-            f"SELECT COUNT(*) FROM ({subquery}) AS t", list(base_params)
-        )
-        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
-
         cat_condition = ""
         cat_params    = []
         if result_category:
             placeholders  = ", ".join(["?" for _ in result_category])
             cat_condition = f"AND pkb.keyword_type IN ({placeholders})"
             cat_params    = list(result_category)
+
+        # totalcount: DISTINCT 키워드 수 (keywords/count와 동일한 기준)
+        totalcount = execute_scalar(f"""
+            SELECT COUNT(DISTINCT kd.keyword_text)
+            FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+            WHERE pkb.paper_id IN ({subquery})
+              AND kd.keyword_text IS NOT NULL
+              AND kd.keyword_text <> ''
+            {cat_condition}
+        """, list(base_params) + cat_params)
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
         # 키워드별 논문 수 집계
         kw_rows = execute_query(f"""
