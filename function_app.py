@@ -428,36 +428,52 @@ def keywords_list(req: func.HttpRequest) -> func.HttpResponse:
         """, list(base_params) + cat_params)
         totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
-        # 키워드별 논문 수 + categories를 서브쿼리 DISTINCT + STRING_AGG로 집계 (쿼리 3→2)
-        # Fabric SQL은 STRING_AGG(DISTINCT ...) 미지원 → 서브쿼리로 우회
+        # 키워드별 논문 수 집계 (Fabric SQL은 STRING_AGG 미지원 → 2쿼리로 분리)
         kw_rows = execute_query(f"""
-            SELECT t.keyword_text, t.paper_count,
-                   STRING_AGG(t.keyword_type, ',') AS categories
-            FROM (
-                SELECT DISTINCT
-                    kd.keyword_text,
-                    COUNT(DISTINCT pkb.paper_id) OVER (PARTITION BY kd.keyword_text) AS paper_count,
-                    pkb.keyword_type
-                FROM gold.paper_keyword_bridge pkb
-                INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
-                WHERE pkb.paper_id IN ({subquery})
-                  AND kd.keyword_text IS NOT NULL
-                  AND kd.keyword_text <> ''
-                {cat_condition}
-            ) t
-            GROUP BY t.keyword_text, t.paper_count
-            ORDER BY t.paper_count DESC, t.keyword_text
+            SELECT
+                kd.keyword_text,
+                COUNT(DISTINCT pkb.paper_id) AS paper_count
+            FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+            WHERE pkb.paper_id IN ({subquery})
+              AND kd.keyword_text IS NOT NULL
+              AND kd.keyword_text <> ''
+            {cat_condition}
+            GROUP BY kd.keyword_text
+            ORDER BY paper_count DESC, kd.keyword_text
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """, list(base_params) + cat_params + [offset, pagesize])
 
-        result_keywords = [
-            {
-                "keyword":    row["keyword_text"],
-                "categories": sorted(row["categories"].split(",")) if row["categories"] else [],
-                "papers":     row["paper_count"]
-            }
-            for row in kw_rows
-        ]
+        result_keywords = []
+        if kw_rows:
+            kw_texts     = [row["keyword_text"] for row in kw_rows]
+            paper_counts = {row["keyword_text"]: row["paper_count"] for row in kw_rows}
+
+            placeholders = ", ".join(["?" for _ in kw_texts])
+            cat_rows = execute_query(f"""
+                SELECT DISTINCT kd.keyword_text, pkb.keyword_type
+                FROM gold.paper_keyword_bridge pkb
+                INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+                WHERE kd.keyword_text IN ({placeholders})
+                  AND pkb.paper_id IN ({subquery})
+                ORDER BY kd.keyword_text, pkb.keyword_type
+            """, kw_texts + list(base_params))
+
+            cat_map = defaultdict(list)
+            for row in cat_rows:
+                kw = row["keyword_text"]
+                kt = row["keyword_type"]
+                if kt and kt not in cat_map[kw]:
+                    cat_map[kw].append(kt)
+
+            result_keywords = [
+                {
+                    "keyword":    kw,
+                    "categories": cat_map.get(kw, []),
+                    "papers":     paper_counts[kw]
+                }
+                for kw in kw_texts
+            ]
 
         return _json_response({
             "pageno": pageno, "pagesize": pagesize,
