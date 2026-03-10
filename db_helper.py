@@ -2,6 +2,7 @@
 import os
 import struct
 import logging
+import time
 import pyodbc
 from itertools import chain, repeat
 from azure.identity import DefaultAzureCredential
@@ -11,6 +12,9 @@ logger = logging.getLogger(__name__)
 # Fabric SQL Endpoint 전용 상수
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 FABRIC_TOKEN_SCOPE = "https://database.windows.net/.default"
+
+# 모듈 레벨 커넥션 캐시 (Flex Consumption은 인스턴스당 단일 요청이므로 thread-safe)
+_cached_conn = None
 
 
 def _get_token_bytes() -> bytes:
@@ -35,9 +39,9 @@ def _get_token_bytes() -> bytes:
     return token_struct
 
 
-def get_connection() -> pyodbc.Connection:
+def _create_new_connection() -> pyodbc.Connection:
     """
-    Gold Layer Warehouse에 연결된 pyodbc Connection 반환
+    Gold Layer Warehouse에 새 pyodbc Connection 생성
     환경변수: FABRIC_SQL_ENDPOINT, FABRIC_DB_NAME
 
     연결 방식:
@@ -81,12 +85,37 @@ def get_connection() -> pyodbc.Connection:
     return conn
 
 
+def get_connection() -> pyodbc.Connection:
+    """
+    캐시된 커넥션 반환. 끊어졌으면 재생성.
+    Flex Consumption은 인스턴스당 단일 요청 처리이므로 thread-safe.
+    """
+    global _cached_conn
+    if _cached_conn is not None:
+        try:
+            _cached_conn.cursor().execute("SELECT 1")
+            return _cached_conn
+        except pyodbc.Error:
+            logger.info("캐시된 DB 연결 끊어짐, 재생성")
+            try:
+                _cached_conn.close()
+            except Exception:
+                pass
+            _cached_conn = None
+
+    t0 = time.time()
+    conn = _create_new_connection()
+    elapsed = time.time() - t0
+    logger.info("DB 신규 연결 소요시간: %.2f초", elapsed)
+    _cached_conn = conn
+    return conn
+
+
 def execute_query(sql: str, params: list = None) -> list[dict]:
     """
     SELECT 쿼리 실행 후 dict 리스트 반환
-    pyodbc Connection은 with 컨텍스트 매니저 미지원 → try/finally 처리
+    캐시된 커넥션 사용 (close하지 않음)
     """
-    conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -95,18 +124,16 @@ def execute_query(sql: str, params: list = None) -> list[dict]:
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
     except pyodbc.Error as e:
         logger.error("execute_query DB 오류: %s | SQL: %.200s", str(e), sql)
+        # 연결 오류 시 캐시 무효화하여 다음 호출에서 재생성
+        _invalidate_connection()
         raise
-    finally:
-        if conn:
-            conn.close()
 
 
 def execute_scalar(sql: str, params: list = None):
     """
     단일 값(COUNT 등) 반환
-    pyodbc Connection은 with 컨텍스트 매니저 미지원 → try/finally 처리
+    캐시된 커넥션 사용 (close하지 않음)
     """
-    conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -115,7 +142,16 @@ def execute_scalar(sql: str, params: list = None):
         return row[0] if row else 0
     except pyodbc.Error as e:
         logger.error("execute_scalar DB 오류: %s | SQL: %.200s", str(e), sql)
+        _invalidate_connection()
         raise
-    finally:
-        if conn:
-            conn.close()
+
+
+def _invalidate_connection():
+    """오류 발생 시 캐시된 커넥션을 무효화"""
+    global _cached_conn
+    if _cached_conn is not None:
+        try:
+            _cached_conn.close()
+        except Exception:
+            pass
+        _cached_conn = None

@@ -107,6 +107,30 @@ def _build_paper_filter(
 
 
 # ──────────────────────────────────────────────────────
+# 0. 워밍업: Timer Trigger (5분 주기) + Health Check
+# ──────────────────────────────────────────────────────
+
+@app.timer_trigger(schedule="0 */5 * * * *", arg_name="timer")
+def warmup_timer(timer: func.TimerRequest) -> None:
+    """5분마다 Fabric 연결 유지 → 콜드 스타트 + Warehouse 일시중지 방지"""
+    try:
+        execute_scalar("SELECT 1")
+        logger.info("Warmup ping 성공")
+    except Exception as e:
+        logger.warning("Warmup ping 실패: %s", e)
+
+
+@app.route(route="v1/health", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def health_check(req: func.HttpRequest) -> func.HttpResponse:
+    """경량 헬스체크 + Fabric 연결 워밍"""
+    try:
+        execute_scalar("SELECT 1")
+        return _json_response({"status": "ok", "db": "connected"})
+    except Exception as e:
+        return _json_response({"status": "degraded", "db": str(e)}, 503)
+
+
+# ──────────────────────────────────────────────────────
 # 1. GET /api/v1/keywords/search
 # ──────────────────────────────────────────────────────
 
