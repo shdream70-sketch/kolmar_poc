@@ -509,7 +509,7 @@ def papers_search(req: func.HttpRequest) -> func.HttpResponse:
       {
         "pageno": 1, "pagesize": 2, "totalcount": 7, "totalpages": 4,
         "papers": [
-          { "paperid": "doi:10.xxx", "title": "...", "journal": "...", "year": 2024 },
+          { "paperid": "doi:10.xxx", "title": "...", "journal": "...", "year": 2024, "paper_url": "https://..." },
           ...
         ]
       }
@@ -555,7 +555,8 @@ def papers_search(req: func.HttpRequest) -> func.HttpResponse:
                 pf.paper_id        AS paperid,
                 pf.title,
                 pf.journal_name    AS journal,
-                pf.published_year  AS year
+                pf.published_year  AS year,
+                pf.paper_url
             FROM gold.paper_fact pf
             WHERE pf.paper_id IN ({subquery})
             {order_clause}
@@ -589,7 +590,7 @@ def papers_detail(req: func.HttpRequest) -> func.HttpResponse:
     Response:
       {
         "paperid": "...", "title": "...", "doi": "...", "abstract": "...",
-        "year": 2024, "journal": "...",
+        "year": 2024, "journal": "...", "paper_url": "https://...",
         "authors": ["John Smith", "Emily Johnson"],
         "main_keyword": "zein",
         "main_material": ["zein"],
@@ -624,7 +625,7 @@ def papers_detail(req: func.HttpRequest) -> func.HttpResponse:
 
         paper_rows = execute_query(f"""
             SELECT pf.paper_id, pf.doi, pf.title, pf.abstract, pf.published_year,
-                   pf.journal_name, pf.main_keyword, pf.publication_type, pf.main_material,
+                   pf.journal_name, pf.paper_url, pf.main_keyword, pf.publication_type, pf.main_material,
                    pad.author_name, pab.author_seq
             FROM gold.paper_fact pf
             LEFT JOIN gold.paper_author_bridge pab ON pf.paper_id = pab.paper_id
@@ -676,6 +677,7 @@ def papers_detail(req: func.HttpRequest) -> func.HttpResponse:
             "abstract":     paper["abstract"],
             "year":         paper["published_year"],
             "journal":      paper["journal_name"],
+            "paper_url":    paper["paper_url"],
             "authors":      authors,
             "main_keyword": paper["main_keyword"],
         }
