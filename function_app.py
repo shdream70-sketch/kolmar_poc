@@ -107,6 +107,48 @@ def _build_paper_filter(
 
 
 # ──────────────────────────────────────────────────────
+# 공통 SQL 빌더: charts API용 paper_id 서브쿼리
+# ──────────────────────────────────────────────────────
+
+def _build_chart_filter(
+    keywords: list,
+    year_start=None,
+    year_end=None
+) -> tuple:
+    """
+    charts API용 paper_id 서브쿼리 + params 반환.
+    keywords[]는 normalized_text AND 조건 (INTERSECT).
+    """
+    parts = []
+    params = []
+
+    for kw in keywords:
+        parts.append("""
+            SELECT pkb.paper_id
+            FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+            WHERE kd.normalized_text = ?
+        """)
+        params.append(kw)
+
+    year_conditions = []
+    year_params = []
+    if year_start:
+        year_conditions.append("pf.published_year >= ?")
+        year_params.append(int(year_start))
+    if year_end:
+        year_conditions.append("pf.published_year <= ?")
+        year_params.append(int(year_end))
+
+    if year_conditions:
+        where = " AND ".join(year_conditions)
+        parts.append(f"SELECT pf.paper_id FROM gold.paper_fact pf WHERE {where}")
+        params.extend(year_params)
+
+    return " INTERSECT ".join(parts), params
+
+
+# ──────────────────────────────────────────────────────
 # 0. 워밍업: Timer Trigger (5분 주기) + Health Check
 # ──────────────────────────────────────────────────────
 
@@ -688,4 +730,296 @@ def papers_detail(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         logger.exception("papers_detail error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 7. POST /api/v1/charts/cooccurrence
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/charts/cooccurrence", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def charts_cooccurrence(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    연관 키워드 강도 (가로막대 차트)
+
+    Request Body:
+      {
+        "keywords": ["nanoparticle", "antioxidant"],  // 필수 1개+
+        "categories": ["formulation"],                // 선택
+        "year_start": 2020,                           // 선택
+        "year_end": 2025                              // 선택
+      }
+
+    Response:
+      { "items": [{ "keyword": "nanoparticle", "paper_count": 42 }, ...] }
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    keywords   = body.get("keywords", [])
+    categories = body.get("categories", [])
+    year_start = body.get("year_start")
+    year_end   = body.get("year_end")
+
+    if not keywords or not isinstance(keywords, list):
+        return _error_response("keywords 배열은 필수이며 1개 이상이어야 합니다.", 400)
+
+    try:
+        chart_filter, params = _build_chart_filter(
+            keywords=keywords, year_start=year_start, year_end=year_end
+        )
+
+        query_params = list(params)
+        cat_condition = ""
+        if categories:
+            placeholders = ", ".join(["?" for _ in categories])
+            cat_condition = f"AND pkb.keyword_type IN ({placeholders})"
+            query_params.extend(categories)
+
+        rows = execute_query(f"""
+            SELECT TOP 15
+                kd.normalized_text AS keyword,
+                COUNT(DISTINCT pkb.paper_id) AS paper_count
+            FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+            WHERE pkb.paper_id IN ({chart_filter})
+              AND kd.normalized_text IS NOT NULL
+              AND kd.normalized_text <> ''
+              AND kd.normalized_text <> 'none'
+              {cat_condition}
+            GROUP BY kd.normalized_text
+            ORDER BY paper_count DESC, kd.normalized_text
+        """, query_params)
+
+        return _json_response({"items": rows})
+
+    except Exception as e:
+        logger.exception("charts_cooccurrence error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 8. POST /api/v1/charts/trend
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/charts/trend", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def charts_trend(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    연도별 연구 트렌드 (라인 차트)
+
+    Request Body:
+      {
+        "keywords": ["nanoparticle"],  // 필수 1개+
+        "year_start": 2020,            // 선택
+        "year_end": 2025               // 선택
+      }
+
+    Response:
+      { "items": [{ "year": 2020, "paper_count": 15 }, ...] }
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    keywords   = body.get("keywords", [])
+    year_start = body.get("year_start")
+    year_end   = body.get("year_end")
+
+    if not keywords or not isinstance(keywords, list):
+        return _error_response("keywords 배열은 필수이며 1개 이상이어야 합니다.", 400)
+
+    try:
+        chart_filter, params = _build_chart_filter(
+            keywords=keywords, year_start=year_start, year_end=year_end
+        )
+
+        rows = execute_query(f"""
+            SELECT
+                pf.published_year AS year,
+                COUNT(DISTINCT pf.paper_id) AS paper_count
+            FROM gold.paper_fact pf
+            WHERE pf.paper_id IN ({chart_filter})
+              AND pf.published_year IS NOT NULL
+            GROUP BY pf.published_year
+            ORDER BY pf.published_year
+        """, list(params))
+
+        return _json_response({"items": rows})
+
+    except Exception as e:
+        logger.exception("charts_trend error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 9. POST /api/v1/charts/papers
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/charts/papers", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def charts_papers(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    논문 목록 (차트용 테이블)
+
+    Request Body:
+      {
+        "keywords": ["nanoparticle"],  // 필수 1개+
+        "categories": ["formulation"], // 선택 (미사용, 공통 파라미터 호환)
+        "year_start": 2020,            // 선택
+        "year_end": 2025,              // 선택
+        "pageno": 1,                   // 선택, 기본 1
+        "pagesize": 20                 // 선택, 기본 20, max 100
+      }
+
+    Response:
+      {
+        "pageno": 1, "pagesize": 20, "totalcount": 150, "totalpages": 8,
+        "items": [
+          { "no": 1, "title": "...", "paper_url": "...", "authors": "John Smith, Emily Jo...", "journal": "...", "year": 2024 }
+        ]
+      }
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    keywords   = body.get("keywords", [])
+    year_start = body.get("year_start")
+    year_end   = body.get("year_end")
+    pageno     = _safe_int(body.get("pageno"),   1,  min_val=1)
+    pagesize   = _safe_int(body.get("pagesize"), 20, min_val=1, max_val=100)
+    offset     = (pageno - 1) * pagesize
+
+    if not keywords or not isinstance(keywords, list):
+        return _error_response("keywords 배열은 필수이며 1개 이상이어야 합니다.", 400)
+
+    try:
+        chart_filter, params = _build_chart_filter(
+            keywords=keywords, year_start=year_start, year_end=year_end
+        )
+
+        # totalcount
+        totalcount = execute_scalar(
+            f"SELECT COUNT(DISTINCT pf.paper_id) FROM gold.paper_fact pf WHERE pf.paper_id IN ({chart_filter})",
+            list(params)
+        )
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
+
+        # 논문 목록
+        paper_rows = execute_query(f"""
+            SELECT
+                pf.paper_id,
+                pf.title,
+                pf.paper_url,
+                pf.journal_name AS journal,
+                pf.published_year AS year
+            FROM gold.paper_fact pf
+            WHERE pf.paper_id IN ({chart_filter})
+            ORDER BY pf.published_year DESC, pf.title
+            OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        """, list(params) + [offset, pagesize])
+
+        # 저자 조회 (STRING_AGG 미지원 → Python groupby)
+        items = []
+        if paper_rows:
+            page_pids = [r["paper_id"] for r in paper_rows]
+            placeholders = ", ".join(["?" for _ in page_pids])
+
+            author_rows = execute_query(f"""
+                SELECT
+                    pab.paper_id,
+                    pad.author_name,
+                    pab.author_seq
+                FROM gold.paper_author_bridge pab
+                INNER JOIN gold.paper_author_dim pad ON pab.author_key = pad.author_key
+                WHERE pab.paper_id IN ({placeholders})
+                ORDER BY pab.paper_id, pab.author_seq
+            """, page_pids)
+
+            author_map = defaultdict(list)
+            for row in author_rows:
+                pid = row["paper_id"]
+                name = row["author_name"]
+                if name and name not in author_map[pid]:
+                    author_map[pid].append(name)
+
+            for idx, row in enumerate(paper_rows):
+                pid = row["paper_id"]
+                authors_str = ", ".join(author_map.get(pid, []))
+                if len(authors_str) > 30:
+                    authors_str = authors_str[:30] + "..."
+                items.append({
+                    "no":        (pageno - 1) * pagesize + idx + 1,
+                    "title":     row["title"],
+                    "paper_url": row["paper_url"],
+                    "authors":   authors_str,
+                    "journal":   row["journal"],
+                    "year":      row["year"]
+                })
+
+        return _json_response({
+            "pageno": pageno, "pagesize": pagesize,
+            "totalcount": totalcount, "totalpages": totalpages,
+            "items": items
+        })
+
+    except Exception as e:
+        logger.exception("charts_papers error")
+        return _error_response(str(e), 500)
+
+
+# ──────────────────────────────────────────────────────
+# 10. POST /api/v1/charts/efficacy
+# ──────────────────────────────────────────────────────
+
+@app.route(route="v1/charts/efficacy", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def charts_efficacy(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    연구 효능 분포 (도넛 차트)
+
+    Request Body:
+      {
+        "keywords": ["nanoparticle"],  // 필수 1개+
+        "year_start": 2020,            // 선택
+        "year_end": 2025               // 선택
+      }
+
+    Response:
+      { "items": [{ "keyword": "anti-aging", "paper_count": 28 }, ...] }
+    """
+    body = _get_json_body(req)
+    if body is None:
+        return _error_response("Invalid JSON body")
+
+    keywords   = body.get("keywords", [])
+    year_start = body.get("year_start")
+    year_end   = body.get("year_end")
+
+    if not keywords or not isinstance(keywords, list):
+        return _error_response("keywords 배열은 필수이며 1개 이상이어야 합니다.", 400)
+
+    try:
+        chart_filter, params = _build_chart_filter(
+            keywords=keywords, year_start=year_start, year_end=year_end
+        )
+
+        rows = execute_query(f"""
+            SELECT
+                kd.normalized_text AS keyword,
+                COUNT(DISTINCT pkb.paper_id) AS paper_count
+            FROM gold.paper_keyword_bridge pkb
+            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+            WHERE pkb.paper_id IN ({chart_filter})
+              AND pkb.keyword_type = 'efficacy'
+              AND kd.normalized_text IS NOT NULL
+              AND kd.normalized_text <> ''
+              AND kd.normalized_text <> 'none'
+            GROUP BY kd.normalized_text
+            ORDER BY paper_count DESC, kd.normalized_text
+        """, list(params))
+
+        return _json_response({"items": rows})
+
+    except Exception as e:
+        logger.exception("charts_efficacy error")
         return _error_response(str(e), 500)
