@@ -1,7 +1,7 @@
 # Premium EP1 배포 방식: Kudu /api/publish?type=zip
 # Ubuntu에서 빌드한 zip을 Azure AD Bearer 토큰으로 Kudu에 직접 업로드
-# Premium EP1으로 전환 (2026-03-28): Cold Start 제거 + Always-ON
-# ODBC Driver 18을 zip에 포함 (Premium Linux 이미지에 미포함)
+# Premium EP1 전환 (2026-03-28): Cold Start 제거 + Always-ON
+# ODBC Driver 18: startup.sh로 런타임 설치 (Debian 11)
 
 name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim2
 
@@ -33,33 +33,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install system dependencies + ODBC Driver 18
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y unixodbc-dev
-          # ODBC Driver 18 설치 (빌드 환경 + zip 포함용)
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
-          echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/$(lsb_release -rs)/prod $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18
-
-      - name: Bundle ODBC Driver into deployment
-        run: |
-          # ODBC Driver .so 파일과 설정을 배포 패키지에 포함
-          mkdir -p .odbc_driver/lib
-          cp /opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18*.so.* .odbc_driver/lib/
-          # odbcinst.ini 생성 (런타임에서 드라이버 검색용)
-          cat > .odbc_driver/odbcinst.ini <<'ODBCEOF'
-          [ODBC Driver 18 for SQL Server]
-          Description=Microsoft ODBC Driver 18 for SQL Server
-          Driver=/home/site/wwwroot/.odbc_driver/lib/libmsodbcsql-18.4.1.1.so
-          UsageCount=1
-          ODBCEOF
-          # 실제 .so 파일명으로 경로 업데이트
-          SO_FILE=$(ls .odbc_driver/lib/libmsodbcsql-18*.so.* | head -1 | xargs basename)
-          sed -i "s|libmsodbcsql-18.4.1.1.so|${SO_FILE}|g" .odbc_driver/odbcinst.ini
-          echo "Bundled ODBC driver: ${SO_FILE}"
-          cat .odbc_driver/odbcinst.ini
 
       - name: Install Python dependencies
         run: |
