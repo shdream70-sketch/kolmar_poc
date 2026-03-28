@@ -2,8 +2,6 @@ import sys as _sys
 import os as _os
 import json
 import logging
-import hashlib
-import time as _time
 from collections import defaultdict
 
 import azure.functions as func
@@ -16,33 +14,6 @@ from db_helper import execute_query, execute_scalar
 
 app = func.FunctionApp()
 logger = logging.getLogger(__name__)
-
-
-# ── In-memory 응답 캐시 (Premium EP1 상시 인스턴스에서 유효) ──
-_response_cache: dict = {}
-_CACHE_TTL = 300  # 5분
-
-
-def _cache_key(endpoint: str, body: dict) -> str:
-    """요청 body를 정규화하여 캐시 키 생성"""
-    normalized = json.dumps(body, sort_keys=True, ensure_ascii=False)
-    return f"{endpoint}:{hashlib.md5(normalized.encode()).hexdigest()}"
-
-
-def _get_cached(key: str):
-    """캐시 조회. TTL 초과 시 None 반환."""
-    if key in _response_cache:
-        data, ts = _response_cache[key]
-        if _time.time() - ts < _CACHE_TTL:
-            logger.info("캐시 HIT: %s", key)
-            return data
-        del _response_cache[key]
-    return None
-
-
-def _set_cache(key: str, data):
-    """캐시 저장."""
-    _response_cache[key] = (data, _time.time())
 
 
 # ──────────────────────────────────────────────────────
@@ -315,12 +286,6 @@ def keywords_mainkeywords(req: func.HttpRequest) -> func.HttpResponse:
     if body is None:
         return _error_response("Invalid JSON body")
 
-    # 캐시 조회
-    ck = _cache_key("mainkeywords", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
-
     keywords = body.get("keywords", [])
     pageno   = _safe_int(body.get("pageno"),   1,  min_val=1)
     pagesize = _safe_int(body.get("pagesize"), 20, min_val=1, max_val=100)
@@ -349,13 +314,11 @@ def keywords_mainkeywords(req: func.HttpRequest) -> func.HttpResponse:
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """, list(params) + [offset, pagesize])
 
-        result = {
+        return _json_response({
             "pageno": pageno, "pagesize": pagesize,
             "totalcount": totalcount, "totalpages": totalpages,
             "mainkeywords": [r["main_keyword"] for r in mk_rows]
-        }
-        _set_cache(ck, result)
-        return _json_response(result)
+        })
 
     except Exception as e:
         logger.exception("keywords_mainkeywords error")
@@ -388,12 +351,6 @@ def keywords_count(req: func.HttpRequest) -> func.HttpResponse:
     body = _get_json_body(req)
     if body is None:
         return _error_response("Invalid JSON body")
-
-    # 캐시 조회
-    ck = _cache_key("count", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
 
     mainkeyword      = body.get("mainkeyword", "").strip()
     keywords         = body.get("keywords", [])
@@ -432,9 +389,7 @@ def keywords_count(req: func.HttpRequest) -> func.HttpResponse:
             {cat_condition}
         """, query_params)
 
-        result = {"count": count}
-        _set_cache(ck, result)
-        return _json_response(result)
+        return _json_response({"count": count})
 
     except Exception as e:
         logger.exception("keywords_count error")
@@ -474,12 +429,6 @@ def keywords_list(req: func.HttpRequest) -> func.HttpResponse:
     body = _get_json_body(req)
     if body is None:
         return _error_response("Invalid JSON body")
-
-    # 캐시 조회
-    ck = _cache_key("list", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
 
     mainkeyword      = body.get("mainkeyword", "").strip()
     keywords         = body.get("keywords", [])
@@ -568,13 +517,11 @@ def keywords_list(req: func.HttpRequest) -> func.HttpResponse:
                 for kw in kw_texts
             ]
 
-        result = {
+        return _json_response({
             "pageno": pageno, "pagesize": pagesize,
             "totalcount": totalcount, "totalpages": totalpages,
             "keywords": result_keywords
-        }
-        _set_cache(ck, result)
-        return _json_response(result)
+        })
 
     except Exception as e:
         logger.exception("keywords_list error")
@@ -612,12 +559,6 @@ def papers_search(req: func.HttpRequest) -> func.HttpResponse:
     body = _get_json_body(req)
     if body is None:
         return _error_response("Invalid JSON body")
-
-    # 캐시 조회
-    ck = _cache_key("papers_search", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
 
     mainkeyword  = body.get("mainkeyword", "").strip()
     keywords     = body.get("keywords", [])
@@ -664,13 +605,11 @@ def papers_search(req: func.HttpRequest) -> func.HttpResponse:
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """, list(params) + [offset, pagesize])
 
-        result = {
+        return _json_response({
             "pageno": pageno, "pagesize": pagesize,
             "totalcount": totalcount, "totalpages": totalpages,
             "papers": papers
-        }
-        _set_cache(ck, result)
-        return _json_response(result)
+        })
 
     except Exception as e:
         logger.exception("papers_search error")
@@ -714,12 +653,6 @@ def papers_detail(req: func.HttpRequest) -> func.HttpResponse:
     body = _get_json_body(req)
     if body is None:
         return _error_response("Invalid JSON body")
-
-    # 캐시 조회
-    ck = _cache_key("papers_detail", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
 
     paperid = body.get("paperid", "").strip()
     title   = body.get("title",   "").strip()
@@ -793,7 +726,6 @@ def papers_detail(req: func.HttpRequest) -> func.HttpResponse:
         for cat in CATEGORIES:
             result[cat] = cat_map[cat]
 
-        _set_cache(ck, result)
         return _json_response(result)
 
     except Exception as e:
@@ -824,12 +756,6 @@ def charts_cooccurrence(req: func.HttpRequest) -> func.HttpResponse:
     body = _get_json_body(req)
     if body is None:
         return _error_response("Invalid JSON body")
-
-    # 캐시 조회
-    ck = _cache_key("cooccurrence", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
 
     keywords   = body.get("keywords", [])
     categories = body.get("categories", [])
@@ -866,9 +792,7 @@ def charts_cooccurrence(req: func.HttpRequest) -> func.HttpResponse:
             ORDER BY paper_count DESC, kd.normalized_text
         """, query_params)
 
-        result = {"items": rows}
-        _set_cache(ck, result)
-        return _json_response(result)
+        return _json_response({"items": rows})
 
     except Exception as e:
         logger.exception("charts_cooccurrence error")
@@ -898,12 +822,6 @@ def charts_trend(req: func.HttpRequest) -> func.HttpResponse:
     if body is None:
         return _error_response("Invalid JSON body")
 
-    # 캐시 조회
-    ck = _cache_key("trend", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
-
     keywords   = body.get("keywords", [])
     year_start = body.get("year_start")
     year_end   = body.get("year_end")
@@ -927,9 +845,7 @@ def charts_trend(req: func.HttpRequest) -> func.HttpResponse:
             ORDER BY pf.published_year
         """, list(params))
 
-        result = {"items": rows}
-        _set_cache(ck, result)
-        return _json_response(result)
+        return _json_response({"items": rows})
 
     except Exception as e:
         logger.exception("charts_trend error")
@@ -966,12 +882,6 @@ def charts_papers(req: func.HttpRequest) -> func.HttpResponse:
     body = _get_json_body(req)
     if body is None:
         return _error_response("Invalid JSON body")
-
-    # 캐시 조회
-    ck = _cache_key("charts_papers", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
 
     keywords   = body.get("keywords", [])
     year_start = body.get("year_start")
@@ -1047,13 +957,11 @@ def charts_papers(req: func.HttpRequest) -> func.HttpResponse:
                     "year":      row["year"]
                 })
 
-        result = {
+        return _json_response({
             "pageno": pageno, "pagesize": pagesize,
             "totalcount": totalcount, "totalpages": totalpages,
             "items": items
-        }
-        _set_cache(ck, result)
-        return _json_response(result)
+        })
 
     except Exception as e:
         logger.exception("charts_papers error")
@@ -1083,12 +991,6 @@ def charts_efficacy(req: func.HttpRequest) -> func.HttpResponse:
     if body is None:
         return _error_response("Invalid JSON body")
 
-    # 캐시 조회
-    ck = _cache_key("efficacy", body)
-    cached = _get_cached(ck)
-    if cached is not None:
-        return _json_response(cached)
-
     keywords   = body.get("keywords", [])
     year_start = body.get("year_start")
     year_end   = body.get("year_end")
@@ -1116,9 +1018,7 @@ def charts_efficacy(req: func.HttpRequest) -> func.HttpResponse:
             ORDER BY paper_count DESC, kd.normalized_text
         """, list(params))
 
-        result = {"items": rows}
-        _set_cache(ck, result)
-        return _json_response(result)
+        return _json_response({"items": rows})
 
     except Exception as e:
         logger.exception("charts_efficacy error")

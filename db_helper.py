@@ -3,48 +3,17 @@ import os
 import struct
 import logging
 import time
-import pathlib
 import pyodbc
 from itertools import chain, repeat
 from azure.identity import DefaultAzureCredential
 
 logger = logging.getLogger(__name__)
 
-# ── 번들된 ODBC Driver 18 검색 (Premium EP1 Linux) ──
-# Premium 이미지에 ODBC Driver 미포함 → 배포 zip에 번들된 드라이버 사용
-_BUNDLE_DIR = pathlib.Path(__file__).parent / ".odbc_driver"
-if _BUNDLE_DIR.exists():
-    _lib_dir = str(_BUNDLE_DIR / "lib")
-    os.environ.setdefault("ODBCSYSINI", str(_BUNDLE_DIR))
-    # LD_LIBRARY_PATH에 번들 라이브러리 경로 추가 (의존 .so 검색용)
-    _ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if _lib_dir not in _ld_path:
-        os.environ["LD_LIBRARY_PATH"] = f"{_lib_dir}:{_ld_path}" if _ld_path else _lib_dir
-    logger.info("번들 ODBC Driver 경로 설정: ODBCSYSINI=%s, LD_LIBRARY_PATH+=%s", _BUNDLE_DIR, _lib_dir)
-
-# ── Connection Pooling: ODBC Driver Manager 풀링 명시 활성화 ──
-# Premium EP1 상시 인스턴스에서 커넥션 풀이 유지되어 재연결 비용 절감
-pyodbc.pooling = True
-
 # Fabric SQL Endpoint 전용 상수
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 FABRIC_TOKEN_SCOPE = "https://database.windows.net/.default"
 
-# ── MI 토큰 캐싱: 모듈 레벨 credential 싱글턴 ──
-# azure-identity 내장 in-memory 토큰 캐싱 활용 (매 호출 시 재생성 방지)
-_credential = DefaultAzureCredential()
-
-def _prewarm_token():
-    """Premium 인스턴스 시작 시 MI 토큰을 미리 캐싱 (IMDS/az login 워밍)"""
-    try:
-        token = _credential.get_token(FABRIC_TOKEN_SCOPE)
-        logger.info("MI 토큰 프리웜 완료 (만료: %s)", token.expires_on)
-    except Exception as e:
-        logger.warning("MI 토큰 프리웜 실패 (무시, 런타임에 재시도): %s", e)
-
-_prewarm_token()
-
-# 모듈 레벨 커넥션 캐시 (Premium EP1은 인스턴스 상시 유지 → 캐시 수명 연장)
+# 모듈 레벨 커넥션 캐시 (Flex Consumption은 인스턴스당 단일 요청이므로 thread-safe)
 _cached_conn = None
 
 
@@ -59,7 +28,8 @@ def _get_token_bytes() -> bytes:
       3. struct.pack으로 길이 헤더 + 바이트 패킹
     Ref: https://learn.microsoft.com/en-us/sql/connect/odbc/using-azure-active-directory
     """
-    token = _credential.get_token(FABRIC_TOKEN_SCOPE).token
+    credential = DefaultAzureCredential()
+    token = credential.get_token(FABRIC_TOKEN_SCOPE).token
 
     # UTF-8 인코딩 후 각 바이트 사이에 null 삽입
     token_bytes   = token.encode("UTF-8")
@@ -118,16 +88,15 @@ def _create_new_connection() -> pyodbc.Connection:
 def get_connection() -> pyodbc.Connection:
     """
     캐시된 커넥션 반환. 끊어졌으면 재생성.
-    Premium EP1 상시 인스턴스에서 커넥션이 장기 유지됨.
+    Flex Consumption은 인스턴스당 단일 요청 처리이므로 thread-safe.
     """
     global _cached_conn
     if _cached_conn is not None:
         try:
             _cached_conn.cursor().execute("SELECT 1")
-            logger.debug("캐시된 DB 연결 재사용")
             return _cached_conn
         except pyodbc.Error:
-            logger.info("캐시된 DB 연결 끊어짐, 재생성 (pooling=%s)", pyodbc.pooling)
+            logger.info("캐시된 DB 연결 끊어짐, 재생성")
             try:
                 _cached_conn.close()
             except Exception:
