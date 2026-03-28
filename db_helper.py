@@ -106,20 +106,12 @@ def get_connection() -> pyodbc.Connection:
     """
     캐시된 커넥션 반환. 끊어졌으면 재생성.
     Premium EP1 상시 인스턴스에서 커넥션이 장기 유지됨.
+    사전 SELECT 1 검증 제거 — 오류 시 execute_query/execute_scalar의
+    except 블록에서 _invalidate_connection() 후 재시도로 처리.
     """
     global _cached_conn
     if _cached_conn is not None:
-        try:
-            _cached_conn.cursor().execute("SELECT 1")
-            logger.debug("캐시된 DB 연결 재사용")
-            return _cached_conn
-        except pyodbc.Error:
-            logger.info("캐시된 DB 연결 끊어짐, 재생성 (pooling=%s)", pyodbc.pooling)
-            try:
-                _cached_conn.close()
-            except Exception:
-                pass
-            _cached_conn = None
+        return _cached_conn
 
     t0 = time.time()
     conn = _create_new_connection()
@@ -133,35 +125,44 @@ def execute_query(sql: str, params: list = None) -> list[dict]:
     """
     SELECT 쿼리 실행 후 dict 리스트 반환
     캐시된 커넥션 사용 (close하지 않음)
+    연결 끊김 시 1회 재시도 (SELECT 1 사전검증 제거에 따른 보완)
     """
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(sql, params or [])
-        columns = [col[0] for col in cursor.description]
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
-    except pyodbc.Error as e:
-        logger.error("execute_query DB 오류: %s | SQL: %.200s", str(e), sql)
-        # 연결 오류 시 캐시 무효화하여 다음 호출에서 재생성
-        _invalidate_connection()
-        raise
+    for attempt in range(2):
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(sql, params or [])
+            columns = [col[0] for col in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except pyodbc.Error as e:
+            _invalidate_connection()
+            if attempt == 0:
+                logger.warning("execute_query 연결 오류, 재시도: %s", e)
+                continue
+            logger.error("execute_query 재시도 실패: %s | SQL: %.200s", str(e), sql)
+            raise
 
 
 def execute_scalar(sql: str, params: list = None):
     """
     단일 값(COUNT 등) 반환
     캐시된 커넥션 사용 (close하지 않음)
+    연결 끊김 시 1회 재시도 (SELECT 1 사전검증 제거에 따른 보완)
     """
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(sql, params or [])
-        row = cursor.fetchone()
-        return row[0] if row else 0
-    except pyodbc.Error as e:
-        logger.error("execute_scalar DB 오류: %s | SQL: %.200s", str(e), sql)
-        _invalidate_connection()
-        raise
+    for attempt in range(2):
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(sql, params or [])
+            row = cursor.fetchone()
+            return row[0] if row else 0
+        except pyodbc.Error as e:
+            _invalidate_connection()
+            if attempt == 0:
+                logger.warning("execute_scalar 연결 오류, 재시도: %s", e)
+                continue
+            logger.error("execute_scalar 재시도 실패: %s | SQL: %.200s", str(e), sql)
+            raise
 
 
 def _invalidate_connection():
