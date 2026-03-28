@@ -3,11 +3,24 @@ import os
 import struct
 import logging
 import time
+import pathlib
 import pyodbc
 from itertools import chain, repeat
 from azure.identity import DefaultAzureCredential
 
 logger = logging.getLogger(__name__)
+
+# ── 번들된 ODBC Driver 18 검색 (Premium EP1 Linux) ──
+# Premium 이미지에 ODBC Driver 미포함 → 배포 zip에 번들된 드라이버 사용
+_BUNDLE_DIR = pathlib.Path(__file__).parent / ".odbc_driver"
+if _BUNDLE_DIR.exists():
+    _lib_dir = str(_BUNDLE_DIR / "lib")
+    os.environ.setdefault("ODBCSYSINI", str(_BUNDLE_DIR))
+    # LD_LIBRARY_PATH에 번들 라이브러리 경로 추가 (의존 .so 검색용)
+    _ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if _lib_dir not in _ld_path:
+        os.environ["LD_LIBRARY_PATH"] = f"{_lib_dir}:{_ld_path}" if _ld_path else _lib_dir
+    logger.info("번들 ODBC Driver 경로 설정: ODBCSYSINI=%s, LD_LIBRARY_PATH+=%s", _BUNDLE_DIR, _lib_dir)
 
 # ── Connection Pooling: ODBC Driver Manager 풀링 명시 활성화 ──
 # Premium EP1 상시 인스턴스에서 커넥션 풀이 유지되어 재연결 비용 절감

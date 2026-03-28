@@ -1,7 +1,6 @@
-# Premium EP1 배포 방식: Kudu /api/publish?type=zip
-# Ubuntu에서 빌드한 zip을 Azure AD Bearer 토큰으로 Kudu에 직접 업로드
+# Premium EP1 배포: Kudu /api/publish?type=zip
+# ODBC Driver 18: Debian 11(Bullseye)용 패키지에서 .so 추출하여 번들
 # Premium EP1 전환 (2026-03-28): Cold Start 제거 + Always-ON
-# ODBC Driver 18: startup.sh로 런타임 설치 (Debian 11)
 
 name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim2
 
@@ -37,6 +36,46 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y unixodbc-dev
+
+      - name: Bundle ODBC Driver 18 (Debian 11 Bullseye)
+        run: |
+          # Debian 11(Bullseye)용 ODBC Driver 18 패키지 다운로드 및 .so 추출
+          # 런타임 컨테이너가 Debian 11이므로 반드시 Bullseye용 패키지 사용
+          mkdir -p /tmp/odbc_extract .odbc_driver/lib
+
+          # MS 패키지 저장소에서 Debian 11용 msodbcsql18 다운로드
+          curl -fsSL "https://packages.microsoft.com/debian/11/prod/pool/main/m/msodbcsql18/" -o /tmp/odbc_index.html
+          DEB_FILE=$(grep -oP 'msodbcsql18_18\.[^"]+_amd64\.deb' /tmp/odbc_index.html | sort -V | tail -1)
+          echo "Downloading: $DEB_FILE"
+          curl -fsSL "https://packages.microsoft.com/debian/11/prod/pool/main/m/msodbcsql18/${DEB_FILE}" -o /tmp/msodbcsql18.deb
+
+          # .deb에서 .so 파일 추출
+          cd /tmp/odbc_extract
+          ar x /tmp/msodbcsql18.deb
+          tar xf data.tar.* 2>/dev/null || tar xzf data.tar.* 2>/dev/null
+          cd -
+
+          # .so 파일 복사
+          cp /tmp/odbc_extract/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18*.so.* .odbc_driver/lib/
+          SO_FILE=$(ls .odbc_driver/lib/libmsodbcsql-18*.so.* | head -1 | xargs basename)
+          echo "Bundled: $SO_FILE"
+
+          # 의존 라이브러리도 번들 (libltdl)
+          cp /usr/lib/x86_64-linux-gnu/libltdl.so.7* .odbc_driver/lib/ 2>/dev/null || true
+          cp /usr/lib/x86_64-linux-gnu/libodbc*.so* .odbc_driver/lib/ 2>/dev/null || true
+
+          # odbcinst.ini 생성
+          cat > .odbc_driver/odbcinst.ini <<ODBCEOF
+          [ODBC Driver 18 for SQL Server]
+          Description=Microsoft ODBC Driver 18 for SQL Server
+          Driver=/home/site/wwwroot/.odbc_driver/lib/${SO_FILE}
+          UsageCount=1
+          ODBCEOF
+
+          echo "=== odbcinst.ini ==="
+          cat .odbc_driver/odbcinst.ini
+          echo "=== Bundled files ==="
+          ls -la .odbc_driver/lib/
 
       - name: Install Python dependencies
         run: |
