@@ -1,9 +1,8 @@
-# Flex Consumption 배포 방식: Kudu /api/publish?type=zip
+# Premium EP1 배포 방식: Kudu /api/publish?type=zip
 # Ubuntu에서 빌드한 zip을 Azure AD Bearer 토큰으로 Kudu에 직접 업로드
-# 이유: WEBSITE_RUN_FROM_PACKAGE 방식은 zip 내 파일 권한이 0으로 설정되어
-#       Linux 컨테이너에서 /home/site/wwwroot 파일을 읽지 못하는 문제 발생
+# Premium EP1으로 전환 (2026-03-28): Cold Start 제거 + Always-ON
 
-name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim
+name: Build and deploy Python project to Azure Function App - kgr-powerbi-prd-apim2
 
 on:
   push:
@@ -13,9 +12,9 @@ on:
 
 env:
   PYTHON_VERSION: '3.10'
-  FUNCTIONAPP_NAME: 'kgr-powerbi-prd-apim'
+  FUNCTIONAPP_NAME: 'kgr-powerbi-prd-apim2'
   RESOURCE_GROUP: 'KOLMAR-BI'
-  KUDU_URL: 'https://kgr-powerbi-prd-apim-ephqhvf6g6erchbt.scm.koreacentral-01.azurewebsites.net'
+  KUDU_URL: 'https://kgr-powerbi-prd-apim2-gzf8fcg9cef6fder.scm.koreacentral-01.azurewebsites.net'
 
 jobs:
   build-and-deploy:
