@@ -53,7 +53,7 @@ def _create_new_connection() -> pyodbc.Connection:
 
     # Azure 환경 (Managed Identity): ActiveDirectoryMsi
     conn_str_msi = (
-        "Driver={ODBC Driver 18 for SQL Server};"
+        "Driver={ODBC Driver 17 for SQL Server};"
         f"Server={endpoint},1433;"
         f"Database={database};"
         "Encrypt=Yes;"
@@ -70,7 +70,7 @@ def _create_new_connection() -> pyodbc.Connection:
 
     # 로컬/대체 환경: 수동 토큰 (DefaultAzureCredential)
     conn_str = (
-        "Driver={ODBC Driver 18 for SQL Server};"
+        "Driver={ODBC Driver 17 for SQL Server};"
         f"Server={endpoint},1433;"
         f"Database={database};"
         "Encrypt=Yes;"
