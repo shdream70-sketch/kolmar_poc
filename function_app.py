@@ -183,18 +183,14 @@ def _build_chart_filter(
 
 @app.timer_trigger(schedule="0 1/5 * * * *", arg_name="timer")
 def warmup_timer(timer: func.TimerRequest) -> None:
-    """5분마다 Gold Layer 데이터 캐시 워밍 + Fabric 연결/노드 유지"""
+    """5분마다 Gold Layer 5개 테이블 데이터 캐시 워밍 + Fabric 연결/노드 유지"""
     try:
-        execute_scalar("""
-            SELECT COUNT(*) FROM (
-                SELECT TOP 1 pf.paper_id
-                FROM gold.paper_fact pf
-                INNER JOIN gold.paper_keyword_bridge pkb ON pf.paper_id = pkb.paper_id
-                INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
-                WHERE pf.main_keyword IS NOT NULL
-            ) t
-        """)
-        logger.info("Warmup ping 성공 (Gold Layer)")
+        execute_scalar("SELECT TOP 1 paper_id FROM gold.paper_fact")
+        execute_scalar("SELECT TOP 1 paper_id FROM gold.paper_keyword_bridge")
+        execute_scalar("SELECT TOP 1 keyword_id FROM gold.keyword_dim")
+        execute_scalar("SELECT TOP 1 author_key FROM gold.paper_author_bridge")
+        execute_scalar("SELECT TOP 1 author_key FROM gold.paper_author_dim")
+        logger.info("Warmup ping 성공 (Gold Layer 5 tables)")
     except Exception as e:
         logger.warning("Warmup ping 실패: %s", e)
 
