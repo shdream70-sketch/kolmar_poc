@@ -181,7 +181,7 @@ def _build_chart_filter(
 # 0. 워밍업: Timer Trigger (5분 주기) + Health Check
 # ──────────────────────────────────────────────────────
 
-@app.timer_trigger(schedule="0 */5 * * * *", arg_name="timer")
+@app.timer_trigger(schedule="0 1/5 * * * *", arg_name="timer")
 def warmup_timer(timer: func.TimerRequest) -> None:
     """5분마다 Gold Layer 데이터 캐시 워밍 + Fabric 연결/노드 유지"""
     try:

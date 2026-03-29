@@ -3,6 +3,7 @@ import os
 import struct
 import logging
 import time
+import threading
 import pyodbc
 from itertools import chain, repeat
 from azure.identity import DefaultAzureCredential
@@ -33,6 +34,8 @@ _prewarm_token()
 
 # 모듈 레벨 커넥션 캐시 (Premium EP1은 인스턴스 상시 유지 → 캐시 수명 연장)
 _cached_conn = None
+# Timer Trigger와 HTTP Trigger 동시 실행 시 _cached_conn 충돌 방지
+_conn_lock = threading.Lock()
 
 
 def _get_token_bytes() -> bytes:
@@ -126,21 +129,23 @@ def execute_query(sql: str, params: list = None) -> list[dict]:
     SELECT 쿼리 실행 후 dict 리스트 반환
     캐시된 커넥션 사용 (close하지 않음)
     연결 끊김 시 1회 재시도 (SELECT 1 사전검증 제거에 따른 보완)
+    _conn_lock으로 Timer/HTTP 동시 접근 방지
     """
-    for attempt in range(2):
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(sql, params or [])
-            columns = [col[0] for col in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
-        except pyodbc.Error as e:
-            _invalidate_connection()
-            if attempt == 0:
-                logger.warning("execute_query 연결 오류, 재시도: %s", e)
-                continue
-            logger.error("execute_query 재시도 실패: %s | SQL: %.200s", str(e), sql)
-            raise
+    with _conn_lock:
+        for attempt in range(2):
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute(sql, params or [])
+                columns = [col[0] for col in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            except pyodbc.Error as e:
+                _invalidate_connection()
+                if attempt == 0:
+                    logger.warning("execute_query 연결 오류, 재시도: %s", e)
+                    continue
+                logger.error("execute_query 재시도 실패: %s | SQL: %.200s", str(e), sql)
+                raise
 
 
 def execute_scalar(sql: str, params: list = None):
@@ -148,21 +153,23 @@ def execute_scalar(sql: str, params: list = None):
     단일 값(COUNT 등) 반환
     캐시된 커넥션 사용 (close하지 않음)
     연결 끊김 시 1회 재시도 (SELECT 1 사전검증 제거에 따른 보완)
+    _conn_lock으로 Timer/HTTP 동시 접근 방지
     """
-    for attempt in range(2):
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(sql, params or [])
-            row = cursor.fetchone()
-            return row[0] if row else 0
-        except pyodbc.Error as e:
-            _invalidate_connection()
-            if attempt == 0:
-                logger.warning("execute_scalar 연결 오류, 재시도: %s", e)
-                continue
-            logger.error("execute_scalar 재시도 실패: %s | SQL: %.200s", str(e), sql)
-            raise
+    with _conn_lock:
+        for attempt in range(2):
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute(sql, params or [])
+                row = cursor.fetchone()
+                return row[0] if row else 0
+            except pyodbc.Error as e:
+                _invalidate_connection()
+                if attempt == 0:
+                    logger.warning("execute_scalar 연결 오류, 재시도: %s", e)
+                    continue
+                logger.error("execute_scalar 재시도 실패: %s | SQL: %.200s", str(e), sql)
+                raise
 
 
 def _invalidate_connection():
