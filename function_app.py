@@ -235,22 +235,21 @@ def keywords_search(req: func.HttpRequest) -> func.HttpResponse:
     pattern = f"%{text}%"
 
     try:
-        totalcount = execute_scalar("""
-            SELECT COUNT(DISTINCT kd.keyword_text)
-            FROM gold.keyword_dim kd
-            WHERE kd.keyword_text LIKE ? OR kd.normalized_text LIKE ?
-        """, [pattern, pattern])
-
-        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
-
-        # SQL 레벨 페이징: 해당 페이지의 키워드만 조회
+        # CTE로 COUNT + 페이징을 1쿼리로 통합 (기존 2쿼리 → 1쿼리)
         paged_keywords = execute_query("""
-            SELECT DISTINCT kd.keyword_text
-            FROM gold.keyword_dim kd
-            WHERE kd.keyword_text LIKE ? OR kd.normalized_text LIKE ?
-            ORDER BY kd.keyword_text
+            WITH kw_matched AS (
+                SELECT DISTINCT kd.keyword_text
+                FROM gold.keyword_dim kd
+                WHERE kd.keyword_text LIKE ? OR kd.normalized_text LIKE ?
+            )
+            SELECT COUNT(*) OVER() AS totalcount, keyword_text
+            FROM kw_matched
+            ORDER BY keyword_text
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """, [pattern, pattern, offset, pagesize])
+
+        totalcount = paged_keywords[0]["totalcount"] if paged_keywords else 0
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
         items = []
         if paged_keywords:
@@ -331,22 +330,24 @@ def keywords_mainkeywords(req: func.HttpRequest) -> func.HttpResponse:
     try:
         subquery, params = _build_paper_filter(keywords=keywords)
 
-        # totalcount: 조건 만족 논문 수
-        # [BUG FIX] params를 COUNT 쿼리와 SELECT 쿼리에 각각 독립적으로 전달
-        totalcount = execute_scalar(
-            f"SELECT COUNT(*) FROM ({subquery}) AS t", list(params)
-        )
-        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
-
-        # 해당 논문들의 main_keyword DISTINCT 목록
+        # CTE로 COUNT + main_keyword 목록을 1쿼리로 통합 (기존 2쿼리 → 1쿼리)
         mk_rows = execute_query(f"""
-            SELECT DISTINCT pf.main_keyword
+            WITH matched AS (
+                {subquery}
+            )
+            SELECT
+                (SELECT COUNT(*) FROM matched) AS totalcount,
+                pf.main_keyword
             FROM gold.paper_fact pf
-            WHERE pf.paper_id IN ({subquery})
+            WHERE pf.paper_id IN (SELECT paper_id FROM matched)
               AND pf.main_keyword IS NOT NULL AND pf.main_keyword <> ''
+            GROUP BY pf.main_keyword
             ORDER BY pf.main_keyword
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """, list(params) + [offset, pagesize])
+
+        totalcount = mk_rows[0]["totalcount"] if mk_rows else 0
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
         result = {
             "pageno": pageno, "pagesize": pagesize,
@@ -506,33 +507,31 @@ def keywords_list(req: func.HttpRequest) -> func.HttpResponse:
             cat_condition = f"AND pkb.keyword_type IN ({placeholders})"
             cat_params    = list(result_category)
 
-        # totalcount: DISTINCT 키워드 수 (keywords/count와 동일한 기준)
-        totalcount = execute_scalar(f"""
-            SELECT COUNT(DISTINCT kd.keyword_text)
-            FROM gold.paper_keyword_bridge pkb
-            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
-            WHERE pkb.paper_id IN ({subquery})
-              AND kd.keyword_text IS NOT NULL
-              AND kd.keyword_text <> ''
-            {cat_condition}
-        """, list(base_params) + cat_params)
-        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
-
-        # 키워드별 논문 수 집계 (Fabric SQL은 STRING_AGG 미지원 → 2쿼리로 분리)
+        # CTE로 COUNT + 키워드 집계를 1쿼리로 통합 (기존 2쿼리 → 1쿼리)
         kw_rows = execute_query(f"""
-            SELECT
-                kd.keyword_text,
-                COUNT(DISTINCT pkb.paper_id) AS paper_count
-            FROM gold.paper_keyword_bridge pkb
-            INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
-            WHERE pkb.paper_id IN ({subquery})
-              AND kd.keyword_text IS NOT NULL
-              AND kd.keyword_text <> ''
-            {cat_condition}
-            GROUP BY kd.keyword_text
-            ORDER BY paper_count DESC, kd.keyword_text
+            WITH matched_papers AS (
+                {subquery}
+            ),
+            kw_agg AS (
+                SELECT
+                    kd.keyword_text,
+                    COUNT(DISTINCT pkb.paper_id) AS paper_count
+                FROM gold.paper_keyword_bridge pkb
+                INNER JOIN gold.keyword_dim kd ON pkb.keyword_id = kd.keyword_id
+                WHERE pkb.paper_id IN (SELECT paper_id FROM matched_papers)
+                  AND kd.keyword_text IS NOT NULL
+                  AND kd.keyword_text <> ''
+                {cat_condition}
+                GROUP BY kd.keyword_text
+            )
+            SELECT COUNT(*) OVER() AS totalcount, keyword_text, paper_count
+            FROM kw_agg
+            ORDER BY paper_count DESC, keyword_text
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """, list(base_params) + cat_params + [offset, pagesize])
+
+        totalcount = kw_rows[0]["totalcount"] if kw_rows else 0
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
 
         result_keywords = []
         if kw_rows:
@@ -632,33 +631,39 @@ def papers_search(req: func.HttpRequest) -> func.HttpResponse:
             mainkeyword=mainkeyword, keywords=keywords
         )
 
-        # [BUG FIX] params를 list()로 복사해서 COUNT/SELECT 쿼리에 독립 전달
-        # 기존: params + [offset, pagesize] 시 subquery 안의 params가 2번 전달되는 버그
-        totalcount = execute_scalar(
-            f"SELECT COUNT(*) FROM ({subquery}) AS t", list(params)
-        )
-        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
-
-        # 정렬 조건
+        # 정렬 조건 + tiebreaker (paper_id) 추가로 결정적 페이징 보장
         order_parts = []
         if sort_title   is not None: order_parts.append(f"pf.title {'ASC' if sort_title else 'DESC'}")
         if sort_journal is not None: order_parts.append(f"pf.journal_name {'ASC' if sort_journal else 'DESC'}")
         if sort_year    is not None: order_parts.append(f"pf.published_year {'ASC' if sort_year else 'DESC'}")
         if not order_parts:          order_parts.append("pf.published_year DESC")
+        order_parts.append("pf.paper_id")  # tiebreaker
         order_clause = "ORDER BY " + ", ".join(order_parts)
 
+        # CTE로 COUNT + 데이터를 1쿼리로 통합 (기존 2쿼리 → 1쿼리)
         papers = execute_query(f"""
+            WITH matched AS (
+                {subquery}
+            )
             SELECT
+                COUNT(*) OVER()    AS totalcount,
                 pf.paper_id        AS paperid,
                 pf.title,
                 pf.journal_name    AS journal,
                 pf.published_year  AS year,
                 pf.paper_url
             FROM gold.paper_fact pf
-            WHERE pf.paper_id IN ({subquery})
+            WHERE pf.paper_id IN (SELECT paper_id FROM matched)
             {order_clause}
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """, list(params) + [offset, pagesize])
+
+        totalcount = papers[0]["totalcount"] if papers else 0
+        totalpages = (totalcount + pagesize - 1) // pagesize if totalcount > 0 else 0
+
+        # totalcount 컬럼을 응답에서 제거
+        for p in papers:
+            p.pop("totalcount", None)
 
         result = {
             "pageno": pageno, "pagesize": pagesize,
@@ -997,7 +1002,7 @@ def charts_papers(req: func.HttpRequest) -> func.HttpResponse:
                 pf.published_year AS year
             FROM gold.paper_fact pf
             WHERE pf.paper_id IN ({chart_filter})
-            ORDER BY pf.published_year DESC, pf.title
+            ORDER BY pf.published_year DESC, pf.title, pf.paper_id
             OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
         """, list(params) + [offset, pagesize])
 
