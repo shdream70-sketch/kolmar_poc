@@ -12,7 +12,7 @@ _pkg_path = _os.path.join(_os.path.dirname(__file__), '.python_packages', 'lib',
 if _pkg_path not in _sys.path:
     _sys.path.insert(0, _pkg_path)
 
-from db_helper import execute_query, execute_scalar
+from db_helper import execute_query, execute_scalar, warmup_queries_in_lock
 
 app = func.FunctionApp()
 logger = logging.getLogger(__name__)
@@ -183,14 +183,16 @@ def _build_chart_filter(
 
 @app.timer_trigger(schedule="0 1/5 * * * *", arg_name="timer")
 def warmup_timer(timer: func.TimerRequest) -> None:
-    """5분마다 Gold Layer 5개 테이블 데이터 캐시 워밍 + Fabric 연결/노드 유지"""
+    """5분마다 Gold Layer 핵심 3개 테이블 캐시 워밍 + Fabric 연결/노드 유지
+    Lock 1회 안에서 전부 실행하여 HTTP 요청과의 커넥션 동시 접근(SIGSEGV) 방지
+    """
     try:
-        execute_scalar("SELECT TOP 1 paper_id FROM gold.paper_fact")
-        execute_scalar("SELECT TOP 1 paper_id FROM gold.paper_keyword_bridge")
-        execute_scalar("SELECT TOP 1 keyword_id FROM gold.keyword_dim")
-        execute_scalar("SELECT TOP 1 author_key FROM gold.paper_author_bridge")
-        execute_scalar("SELECT TOP 1 author_key FROM gold.paper_author_dim")
-        logger.info("Warmup ping 성공 (Gold Layer 5 tables)")
+        warmup_queries_in_lock([
+            "SELECT TOP 1 paper_id FROM gold.paper_fact",
+            "SELECT TOP 1 paper_id FROM gold.paper_keyword_bridge",
+            "SELECT TOP 1 keyword_id FROM gold.keyword_dim",
+        ])
+        logger.info("Warmup ping 성공 (Gold Layer 3 tables)")
     except Exception as e:
         logger.warning("Warmup ping 실패: %s", e)
 

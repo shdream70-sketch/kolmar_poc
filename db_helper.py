@@ -172,6 +172,30 @@ def execute_scalar(sql: str, params: list = None):
                 raise
 
 
+def warmup_queries_in_lock(queries: list[str]):
+    """
+    Lock 1회 안에서 여러 쿼리를 순차 실행 (warmup 전용)
+    execute_scalar를 여러 번 호출하면 Lock 획득/해제 사이에
+    HTTP 스레드가 끼어들어 동일 커넥션에 동시 접근 → SIGSEGV 발생.
+    이 함수는 Lock을 한 번만 잡고 모든 쿼리를 실행하여 충돌을 방지.
+    """
+    with _conn_lock:
+        for attempt in range(2):
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                for sql in queries:
+                    cursor.execute(sql)
+                    cursor.fetchone()
+                return
+            except pyodbc.Error as e:
+                _invalidate_connection()
+                if attempt == 0:
+                    logger.warning("warmup 연결 오류, 재시도: %s", e)
+                    continue
+                raise
+
+
 def _invalidate_connection():
     """오류 발생 시 캐시된 커넥션을 무효화"""
     global _cached_conn
