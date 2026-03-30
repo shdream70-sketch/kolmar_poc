@@ -12,7 +12,9 @@ _pkg_path = _os.path.join(_os.path.dirname(__file__), '.python_packages', 'lib',
 if _pkg_path not in _sys.path:
     _sys.path.insert(0, _pkg_path)
 
-from db_helper import execute_query, execute_scalar, warmup_queries_in_lock
+import requests as _requests
+
+from db_helper import execute_query, execute_scalar
 
 app = func.FunctionApp()
 logger = logging.getLogger(__name__)
@@ -178,23 +180,33 @@ def _build_chart_filter(
 
 
 # ──────────────────────────────────────────────────────
-# 0. 워밍업: Timer Trigger (5분 주기) + Health Check
+# 0. 워밍업: Timer Trigger (3분 주기) + Health Check
 # ──────────────────────────────────────────────────────
 
-@app.timer_trigger(schedule="0 1/5 * * * *", arg_name="timer")
+# Self-call URL: 자기 앱의 health endpoint를 HTTP로 호출하여
+# HTTP 워커 스레드의 thread-local 커넥션을 유지.
+# Azure TCP idle timeout(4분) 이내에 갱신하기 위해 3분 간격.
+_SELF_BASE_URL = _os.environ.get(
+    "WEBSITE_HOSTNAME", "localhost:7071"
+)
+_SELF_FUNC_KEY = _os.environ.get("WARMUP_SELF_KEY", "")
+
+@app.timer_trigger(schedule="0 */3 * * * *", arg_name="timer")
 def warmup_timer(timer: func.TimerRequest) -> None:
-    """5분마다 Gold Layer 핵심 3개 테이블 캐시 워밍 + Fabric 연결/노드 유지
-    Lock 1회 안에서 전부 실행하여 HTTP 요청과의 커넥션 동시 접근(SIGSEGV) 방지
+    """3분마다 자기 앱 health endpoint를 HTTP 호출하여
+    HTTP 워커 스레드의 DB 커넥션 + Fabric 노드를 유지.
+    Timer 스레드에서 직접 SQL 접근하지 않으므로 SIGSEGV 위험 없음.
     """
     try:
-        warmup_queries_in_lock([
-            "SELECT TOP 1 paper_id FROM gold.paper_fact",
-            "SELECT TOP 1 paper_id FROM gold.paper_keyword_bridge",
-            "SELECT TOP 1 keyword_id FROM gold.keyword_dim",
-        ])
-        logger.info("Warmup ping 성공 (Gold Layer 3 tables)")
+        scheme = "https" if "azurewebsites" in _SELF_BASE_URL else "http"
+        url = f"{scheme}://{_SELF_BASE_URL}/api/v1/health"
+        headers = {}
+        if _SELF_FUNC_KEY:
+            headers["x-functions-key"] = _SELF_FUNC_KEY
+        resp = _requests.get(url, headers=headers, timeout=10)
+        logger.info("Warmup self-call 성공: %s %s", resp.status_code, resp.text[:100])
     except Exception as e:
-        logger.warning("Warmup ping 실패: %s", e)
+        logger.warning("Warmup self-call 실패: %s", e)
 
 
 @app.route(route="v1/health", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)

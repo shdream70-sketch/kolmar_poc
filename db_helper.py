@@ -10,9 +10,10 @@ from azure.identity import DefaultAzureCredential
 
 logger = logging.getLogger(__name__)
 
-# ── Connection Pooling: ODBC Driver Manager 풀링 명시 활성화 ──
-# Premium EP1 상시 인스턴스에서 커넥션 풀이 유지되어 재연결 비용 절감
-pyodbc.pooling = True
+# ── Connection Pooling: 비활성화 ──
+# Linux(unixODBC)에서 pyodbc.pooling은 불안정하므로 비활성화.
+# 대신 threading.local()로 스레드별 커넥션을 직접 관리.
+pyodbc.pooling = False
 
 # Fabric SQL Endpoint 전용 상수
 SQL_COPT_SS_ACCESS_TOKEN = 1256
@@ -32,10 +33,11 @@ def _prewarm_token():
 
 _prewarm_token()
 
-# 모듈 레벨 커넥션 캐시 (Premium EP1은 인스턴스 상시 유지 → 캐시 수명 연장)
-_cached_conn = None
-# Timer Trigger와 HTTP Trigger 동시 실행 시 _cached_conn 충돌 방지
-_conn_lock = threading.Lock()
+# ── 스레드별 커넥션 격리 (threading.local) ──
+# pyodbc threadsafety=1: "threads may share the module but not connections"
+# 커넥션을 스레드 간 공유하면 ODBC 드라이버 C 레벨에서 SIGSEGV 발생.
+# threading.local()로 각 스레드가 자기 커넥션만 사용하도록 격리.
+_thread_local = threading.local()
 
 
 def _get_token_bytes() -> bytes:
@@ -107,101 +109,71 @@ def _create_new_connection() -> pyodbc.Connection:
 
 def get_connection() -> pyodbc.Connection:
     """
-    캐시된 커넥션 반환. 끊어졌으면 재생성.
-    Premium EP1 상시 인스턴스에서 커넥션이 장기 유지됨.
-    사전 SELECT 1 검증 제거 — 오류 시 execute_query/execute_scalar의
-    except 블록에서 _invalidate_connection() 후 재시도로 처리.
+    현재 스레드의 캐시된 커넥션 반환. 없거나 끊어졌으면 재생성.
+    threading.local()로 스레드별 격리 — 다른 스레드와 커넥션 공유 없음.
     """
-    global _cached_conn
-    if _cached_conn is not None:
-        return _cached_conn
+    conn = getattr(_thread_local, 'conn', None)
+    if conn is not None:
+        return conn
 
     t0 = time.time()
     conn = _create_new_connection()
     elapsed = time.time() - t0
-    logger.info("DB 신규 연결 소요시간: %.2f초", elapsed)
-    _cached_conn = conn
+    logger.info("DB 신규 연결 소요시간: %.2f초 (thread=%s)", elapsed, threading.current_thread().name)
+    _thread_local.conn = conn
     return conn
+
+
+def _invalidate_connection():
+    """오류 발생 시 현재 스레드의 캐시된 커넥션을 무효화"""
+    conn = getattr(_thread_local, 'conn', None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _thread_local.conn = None
 
 
 def execute_query(sql: str, params: list = None) -> list[dict]:
     """
     SELECT 쿼리 실행 후 dict 리스트 반환
-    캐시된 커넥션 사용 (close하지 않음)
-    연결 끊김 시 1회 재시도 (SELECT 1 사전검증 제거에 따른 보완)
-    _conn_lock으로 Timer/HTTP 동시 접근 방지
+    스레드별 커넥션 사용 (close하지 않음, 스레드 내 재사용)
+    연결 끊김 시 1회 재시도
     """
-    with _conn_lock:
-        for attempt in range(2):
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute(sql, params or [])
-                columns = [col[0] for col in cursor.description]
-                return [dict(zip(columns, row)) for row in cursor.fetchall()]
-            except pyodbc.Error as e:
-                _invalidate_connection()
-                if attempt == 0:
-                    logger.warning("execute_query 연결 오류, 재시도: %s", e)
-                    continue
-                logger.error("execute_query 재시도 실패: %s | SQL: %.200s", str(e), sql)
-                raise
+    for attempt in range(2):
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(sql, params or [])
+            columns = [col[0] for col in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except pyodbc.Error as e:
+            _invalidate_connection()
+            if attempt == 0:
+                logger.warning("execute_query 연결 오류, 재시도: %s", e)
+                continue
+            logger.error("execute_query 재시도 실패: %s | SQL: %.200s", str(e), sql)
+            raise
 
 
 def execute_scalar(sql: str, params: list = None):
     """
     단일 값(COUNT 등) 반환
-    캐시된 커넥션 사용 (close하지 않음)
-    연결 끊김 시 1회 재시도 (SELECT 1 사전검증 제거에 따른 보완)
-    _conn_lock으로 Timer/HTTP 동시 접근 방지
+    스레드별 커넥션 사용 (close하지 않음, 스레드 내 재사용)
+    연결 끊김 시 1회 재시도
     """
-    with _conn_lock:
-        for attempt in range(2):
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute(sql, params or [])
-                row = cursor.fetchone()
-                return row[0] if row else 0
-            except pyodbc.Error as e:
-                _invalidate_connection()
-                if attempt == 0:
-                    logger.warning("execute_scalar 연결 오류, 재시도: %s", e)
-                    continue
-                logger.error("execute_scalar 재시도 실패: %s | SQL: %.200s", str(e), sql)
-                raise
-
-
-def warmup_queries_in_lock(queries: list[str]):
-    """
-    Lock 1회 안에서 여러 쿼리를 순차 실행 (warmup 전용)
-    execute_scalar를 여러 번 호출하면 Lock 획득/해제 사이에
-    HTTP 스레드가 끼어들어 동일 커넥션에 동시 접근 → SIGSEGV 발생.
-    이 함수는 Lock을 한 번만 잡고 모든 쿼리를 실행하여 충돌을 방지.
-    """
-    with _conn_lock:
-        for attempt in range(2):
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                for sql in queries:
-                    cursor.execute(sql)
-                    cursor.fetchone()
-                return
-            except pyodbc.Error as e:
-                _invalidate_connection()
-                if attempt == 0:
-                    logger.warning("warmup 연결 오류, 재시도: %s", e)
-                    continue
-                raise
-
-
-def _invalidate_connection():
-    """오류 발생 시 캐시된 커넥션을 무효화"""
-    global _cached_conn
-    if _cached_conn is not None:
+    for attempt in range(2):
         try:
-            _cached_conn.close()
-        except Exception:
-            pass
-        _cached_conn = None
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(sql, params or [])
+            row = cursor.fetchone()
+            return row[0] if row else 0
+        except pyodbc.Error as e:
+            _invalidate_connection()
+            if attempt == 0:
+                logger.warning("execute_scalar 연결 오류, 재시도: %s", e)
+                continue
+            logger.error("execute_scalar 재시도 실패: %s | SQL: %.200s", str(e), sql)
+            raise
